@@ -13,11 +13,12 @@ os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 import sys
 import json
 import time
-import math
 
 sys.path.insert(0, "/home/ubuntu/DS-MeZO")
 
-from vllm import LLM
+from vllm import LLM, SamplingParams
+from ds_mezo.model_config import discover_layers
+from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
 
 
@@ -52,7 +53,6 @@ def score_fn(text):
         compile(text, "<eval>", "exec")
         return len(text)
     except SyntaxError:
-        # Try extracting code block
         if "```python" in text:
             code = text.split("```python")[1].split("```")[0]
             try:
@@ -67,7 +67,6 @@ def score_fn(text):
                 return len(code)
             except SyntaxError:
                 pass
-        # Partial credit: length of text if it contains def/class keywords
         if "def " in text or "class " in text:
             return len(text) // 2
         return 0
@@ -97,24 +96,25 @@ def main():
         enable_lora=True,
         max_lora_rank=64,
         max_num_seqs=8,
-        enforce_eager=True,  # Required for activation extraction hooks
+        enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
     print("Initializing controller...")
     t0 = time.time()
-    controller = DSMeZO_Controller(llm, config)
+    layer_specs = discover_layers(config["model_path"], ["q_proj", "v_proj"])
+    backend = VLLMBackend(llm, layer_specs, 16)
+    controller = DSMeZO_Controller(backend, layer_specs, config)
     print(f"Controller initialized in {time.time()-t0:.1f}s")
     print(f"Layers: {controller.num_layers} | "
           f"Params: {sum(l['A'].numel()+l['B'].numel() for l in controller.layers):,}")
 
-    # Initial activation calibration (normally done in train())
+    # Initial activation calibration
     controller._calibrate_activation_bases_full([PROMPTS[0]])
     print(f"Activation bases calibrated: {len(controller.activation_bases)} layers")
 
     # --- Pre-training baseline ---
     print("\n--- Pre-training baseline ---")
-    from vllm import SamplingParams
     baseline_scores = []
     baseline_outputs = llm.generate(
         PROMPTS[:5],
@@ -133,7 +133,6 @@ def main():
     log = []
     t_start = time.time()
 
-    # Override train() to capture per-step metrics
     for step_idx in range(total_steps):
         batch = [PROMPTS[step_idx % len(PROMPTS)]]
         controller.step(batch)
@@ -171,7 +170,7 @@ def main():
     post_outputs = llm.generate(
         PROMPTS[:5],
         SamplingParams(max_tokens=256, temperature=0.7),
-        lora_request=controller.lora_pos,
+        lora_request=backend.lora_pos,
     )
     for i, out in enumerate(post_outputs):
         text = out.outputs[0].text
@@ -195,7 +194,6 @@ def main():
         loss_delta = controller.loss_ema - controller.initial_loss_ema
         print(f"  Loss EMA delta:          {loss_delta:+.4f}")
 
-    # Loss trajectory (first 10 vs last 10 steps)
     early_loss = [e["loss_ema"] for e in log[:10] if e["loss_ema"] is not None]
     late_loss = [e["loss_ema"] for e in log[-10:] if e["loss_ema"] is not None]
     if early_loss and late_loss:
@@ -205,7 +203,6 @@ def main():
     print(f"  Training time:           {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
     print(f"  Steps completed:         {total_steps}")
 
-    # Save log
     log_path = "/home/ubuntu/DS-MeZO/eval/results.json"
     with open(log_path, "w") as f:
         json.dump({

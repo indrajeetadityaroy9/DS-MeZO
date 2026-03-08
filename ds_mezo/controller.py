@@ -1,7 +1,9 @@
 """DS-MeZO Controller: zeroth-order optimization for LLM fine-tuning.
 
-Single-file implementation of the DS-MeZO training loop including:
-- PiSSA adapter management and vLLM integration
+Algorithm-only implementation — no vLLM imports. All inference calls go
+through the backend object passed at init.
+
+Components:
 - AGZO activation-guided subspace perturbation
 - Momentum-aligned sensitivity masking (applied at update step)
 - SPSA gradient estimation with adaptive epsilon and DD clipping
@@ -15,21 +17,11 @@ Reference: DS_MeZO_Combined.md §8 with Bug 1 (GR cancellation) and Bug 2 (maski
 
 import math
 import os
-import json
-import re
-import shutil
-
-os.environ["USE_TF"] = "0"
-os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import torch
-from vllm import SamplingParams
-from vllm.lora.request import LoRARequest
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
 from ds_mezo.kernels import zo_muon_update, fused_perturb_dual
 
-
-ADAPTER_STAGING_DIR = "/dev/shm/ds_mezo"
 
 DEFAULTS = {
     "rank": 16,
@@ -47,127 +39,16 @@ DEFAULTS = {
     "eps_floor": 0.1,
     "mask_warmup": 10,
     "score_fn": lambda text: len(text),
+    "mode": "rl",
 }
 
 
-# ---------------------------------------------------------------------------
-# Module-level helpers
-# ---------------------------------------------------------------------------
-
-def write_adapter_config(adapter_dir, rank, target_modules):
-    """Write PEFT adapter config (once at init, not every sync)."""
-    config = {
-        "peft_type": "LORA",
-        "r": rank,
-        "lora_alpha": rank,
-        "target_modules": target_modules,
-        "bias": "none",
-        "task_type": "CAUSAL_LM",
-    }
-    with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
-        json.dump(config, f)
-
-
-def save_peft_adapter(A_list, B_list, adapter_dir, layer_configs):
-    """Serialize A, B matrices as PEFT-compatible LoRA adapter (BF16).
-
-    PiSSA convention: W = W_res + A @ B where A:(d_out, r), B:(r, d_in)
-    PEFT convention:  W = W0 + lora_B @ lora_A where lora_A:(r, d_in), lora_B:(d_out, r)
-    Therefore: lora_A.weight = B, lora_B.weight = A"""
-    tensors = {}
-    for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
-        prefix = layer_configs[layer_idx]["peft_prefix"]
-        tensors[f"{prefix}.lora_A.weight"] = B_l.bfloat16()   # B → lora_A (r × d_in)
-        tensors[f"{prefix}.lora_B.weight"] = A_l.bfloat16()   # A → lora_B (d_out × r)
-    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
-
-
-def extract_prompt_logprobs(output, prompt_token_ids):
-    """Extract per-token logprobs from vLLM output."""
-    logprobs = []
-    for i, token_lp in enumerate(output.prompt_logprobs[1:], 1):
-        tok_id = prompt_token_ids[i]
-        logprobs.append(token_lp[tok_id].logprob)
-    return logprobs
-
-
-def _register_activation_hooks(worker, target_modules):
-    """Register forward hooks in the worker process. Called via collective_rpc.
-
-    vLLM merges q/k/v projections into a single qkv_proj module.
-    Since q_proj and v_proj share the same input activations, we register
-    on qkv_proj and store the activation under all target module keys."""
-    model = worker.get_model()
-    worker._ds_mezo_hooks = []
-    worker._ds_mezo_activations = {}
-
-    for name, module in model.named_modules():
-        if "base_layer" in name:
-            continue
-        match = re.search(r"layers\.(\d+)", name)
-        if match is None:
-            continue
-        layer_idx = int(match.group(1))
-
-        # Match target modules directly or via vLLM's merged qkv_proj.
-        # Check qkv_proj first since "q_proj" is a substring of "qkv_proj".
-        if "qkv_proj" in name:
-            # vLLM merges q_proj+k_proj+v_proj — input activations are shared
-            matched_targets = [tm for tm in target_modules
-                               if tm in ("q_proj", "v_proj", "k_proj")]
-        else:
-            matched_targets = [tm for tm in target_modules if tm in name]
-        if not matched_targets:
-            continue
-
-        keys = [(layer_idx, tm) for tm in matched_targets]
-
-        def hook_fn(mod, inp, out, ks=keys):
-            act = inp[0].detach().float().cpu()
-            for k in ks:
-                worker._ds_mezo_activations[k] = act
-
-        worker._ds_mezo_hooks.append(module.register_forward_hook(hook_fn))
-    return len(worker._ds_mezo_hooks)
-
-
-def _collect_and_remove_hooks(worker):
-    """Collect activation data and remove hooks. Called via collective_rpc."""
-    activations = worker._ds_mezo_activations
-    for h in worker._ds_mezo_hooks:
-        h.remove()
-    worker._ds_mezo_hooks = []
-    worker._ds_mezo_activations = {}
-    return activations
-
-
-def extract_layer_activations(engine, input_data, target_modules):
-    """Extract per-layer input activations via forward hooks on vLLM's model.
-
-    vLLM v0.17+ runs the model in a separate worker process.
-    Strategy: register hooks → generate (triggers forward pass) → collect."""
-    engine.llm_engine.collective_rpc(
-        _register_activation_hooks, args=(target_modules,)
-    )
-
-    engine.generate(
-        input_data,
-        SamplingParams(max_tokens=1, temperature=0.0),
-    )
-
-    results = engine.llm_engine.collective_rpc(_collect_and_remove_hooks)
-    return results[0]  # Single-GPU: first worker's results
-
-
-# ---------------------------------------------------------------------------
-# Controller
-# ---------------------------------------------------------------------------
-
 class DSMeZO_Controller:
-    def __init__(self, engine, config):
-        self.engine = engine
+    def __init__(self, backend, layer_specs, config):
+        self.backend = backend
         cfg = {**DEFAULTS, **config}
 
+        self.mode = cfg["mode"]
         self.score_fn = cfg["score_fn"]
         self.step_count = 0
         self.total_steps = cfg["total_steps"]
@@ -180,51 +61,24 @@ class DSMeZO_Controller:
             device="cuda",
         )
 
-        # Parse layer structure from adapter keys
-        layer_set = set()
-        for key in adapter_tensors:
-            match = re.search(r"layers\.(\d+)\.self_attn\.(\w+)", key)
-            if match:
-                layer_set.add((int(match.group(1)), match.group(2)))
-
         self.layers = []
-        for layer_idx, module_name in sorted(layer_set):
-            prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{module_name}"
+        for ls in layer_specs:
             # PEFT → PiSSA: lora_A (r×d_in) = B, lora_B (d_out×r) = A
-            B = adapter_tensors[f"{prefix}.lora_A.weight"].float()  # r × d_in
-            A = adapter_tensors[f"{prefix}.lora_B.weight"].float()  # d_out × r
+            B = adapter_tensors[f"{ls.peft_prefix}.lora_A.weight"].float()
+            A = adapter_tensors[f"{ls.peft_prefix}.lora_B.weight"].float()
             self.layers.append({
                 "A": A, "B": B,
-                "layer_idx": layer_idx,
-                "module_name": module_name,
-                "peft_prefix": prefix,
+                "layer_idx": ls.layer_idx,
+                "module_name": ls.module_name,
+                "peft_prefix": ls.peft_prefix,
             })
         del adapter_tensors
 
         self.num_layers = len(self.layers)
         rank = cfg["rank"]
 
-        # Create fresh staging directories (deterministic clean start)
-        shutil.rmtree(ADAPTER_STAGING_DIR, ignore_errors=True)
-        self.adapter_dir_pos = os.path.join(ADAPTER_STAGING_DIR, "adapter_pos")
-        self.adapter_dir_neg = os.path.join(ADAPTER_STAGING_DIR, "adapter_neg")
-        self.checkpoint_dir = os.path.join(ADAPTER_STAGING_DIR, "checkpoints")
-        os.makedirs(self.adapter_dir_pos)
-        os.makedirs(self.adapter_dir_neg)
-        os.makedirs(self.checkpoint_dir)
-
-        # Write adapter config once (not on every sync)
-        unique_modules = list({l["module_name"] for l in self.layers})
-        write_adapter_config(self.adapter_dir_pos, rank, unique_modules)
-        write_adapter_config(self.adapter_dir_neg, rank, unique_modules)
-
-        self.lora_pos = LoRARequest("adapter_pos", 1, self.adapter_dir_pos, load_inplace=True)
-        self.lora_neg = LoRARequest("adapter_neg", 2, self.adapter_dir_neg, load_inplace=True)
+        # Initial adapter sync
         self._sync_adapters({}, {})
-
-        self.score_params = SamplingParams(
-            max_tokens=1, prompt_logprobs=1, temperature=0.0
-        )
 
         # Exploration — entropy-guided temperature annealing (§7.3)
         self.num_candidates = cfg["num_candidates"]
@@ -240,14 +94,15 @@ class DSMeZO_Controller:
         self.delta_kl = cfg["delta_kl"]
 
         # Perturbation — adaptive epsilon (§2.1)
-        self.eps_base = 1e-3 / math.sqrt(rank)  # derived from rank
+        # RL: scaled by rank for AGZO subspace; SFT: fixed 1e-3 for full-rank
+        self.eps_base = 1e-3 if self.mode == "sft" else 1e-3 / math.sqrt(rank)
         self.eps = self.eps_base
         self.eps_floor = cfg["eps_floor"]
         self.initial_loss_ema = None
 
         # Optimizer: ZO-Muon (§5)
         self.eta_max = cfg["eta_max"]
-        self.eta_min = self.eta_max / 100  # derived from eta_max
+        self.eta_min = self.eta_max / 100
         self.eta = self.eta_max
         self.momentum = cfg["momentum"]
 
@@ -268,7 +123,7 @@ class DSMeZO_Controller:
 
         # Activation subspace tracking — per-step power iteration (§3.5)
         self.r_calib = cfg["r_calib"]
-        self.power_iter_steps = 3  # K=3 per §3.5
+        self.power_iter_steps = 3
         self.drift_threshold = cfg["drift_threshold"]
         self.activation_bases = {}
 
@@ -282,15 +137,13 @@ class DSMeZO_Controller:
 
     def _calibrate_activation_bases_full(self, input_data):
         """Full SVD calibration — used at init and on drift detection."""
-        activations = extract_layer_activations(
-            self.engine, input_data, self.target_modules
-        )
+        activations = self.backend.extract_activations(input_data)
         for layer in self.layers:
             key = (layer["layer_idx"], layer["module_name"])
-            H = activations[key]  # batch*seq_len × d_in
+            H = activations[key]
             r_calib = min(self.r_calib, H.shape[1])
             _, _, V = torch.svd_lowrank(H, q=r_calib, niter=2)
-            self.activation_bases[key] = V.float()  # d_in × r_calib
+            self.activation_bases[key] = V.float()
 
     def _update_activation_bases_power_iter(self, activations):
         """Per-step warm-started power iteration (§3.5)."""
@@ -303,7 +156,6 @@ class DSMeZO_Controller:
             for _ in range(self.power_iter_steps):
                 V = H.T @ (H @ V)
                 V, _ = torch.linalg.qr(V)
-            # Drift check (§3.5 — LOTUS criterion)
             alignment = torch.trace(V.T @ V_old).abs() / self.r_calib
             if alignment < self.drift_threshold:
                 needs_full_recalib = True
@@ -313,73 +165,50 @@ class DSMeZO_Controller:
     # -- Perturbation (§3.2) ------------------------------------------------
 
     def _get_perturbation(self, layer):
-        """AGZO subspace perturbation for A and B.
-        Masking is NOT applied here — Bug 2 fix moves it to update step."""
+        """AGZO subspace perturbation for A and B."""
         A, B = layer["A"], layer["B"]
         key = (layer["layer_idx"], layer["module_name"])
         V_l = self.activation_bases[key].to(device=B.device)
 
-        # B: AGZO subspace perturbation (r × d_in, in span(V_l))
         z_coeff_B = torch.randn(B.shape[0], V_l.shape[1], device=B.device)
         z_B = z_coeff_B @ V_l.T
 
-        # A: projected perturbation
-        BV = B @ V_l  # r × r_calib
-        Q, _ = torch.linalg.qr(BV)  # r × min(r, r_calib)
+        BV = B @ V_l
+        Q, _ = torch.linalg.qr(BV)
         z_coeff_A = torch.randn(A.shape[0], Q.shape[1], device=A.device)
-        z_A = z_coeff_A @ Q.T  # d_out × r
+        z_A = z_coeff_A @ Q.T
 
         return z_A * self.eps, z_B * self.eps
 
     # -- Adapter Sync -------------------------------------------------------
 
     def _sync_adapters(self, pos_overrides, neg_overrides):
-        """Serialize PiSSA adapters to /dev/shm for vLLM."""
-        def get_AB(overrides):
-            A_list, B_list = [], []
-            for layer in self.layers:
-                k = (layer["layer_idx"], layer["module_name"])
-                if k in overrides:
-                    A_l, B_l = overrides[k]
-                else:
-                    A_l, B_l = layer["A"], layer["B"]
-                A_list.append(A_l)
-                B_list.append(B_l)
-            return A_list, B_list
-
-        A_pos, B_pos = get_AB(pos_overrides)
-        save_peft_adapter(A_pos, B_pos, self.adapter_dir_pos, self.layers)
-
-        A_neg, B_neg = get_AB(neg_overrides)
-        save_peft_adapter(A_neg, B_neg, self.adapter_dir_neg, self.layers)
+        """Delegate adapter serialization to backend."""
+        self.backend.sync_adapters(pos_overrides, neg_overrides, self.layers)
 
     # -- Scoring (§4.3) -----------------------------------------------------
 
     def _get_prompt_logprobs(self, token_sequences, lora_request):
-        """Score token sequences under a LoRA adapter via vLLM prefill."""
-        prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
-        outputs = self.engine.generate(
-            prompts, sampling_params=self.score_params, lora_request=lora_request,
-        )
-        return [
-            extract_prompt_logprobs(out, seq)
-            for out, seq in zip(outputs, token_sequences)
-        ]
+        """Score token sequences under a LoRA adapter."""
+        return self.backend.score(token_sequences, lora_request)
 
     def _score_contrastive(self, trajectories, advantages):
         """Advantage-weighted NLL with asymmetric gradient regularization.
 
-        Bug 1 fix: GR term computed as NLL divergence between θ+ and θ-,
-        added only to loss_pos so it doesn't cancel in finite differences."""
+        When RLOO advantages are both zero (all candidates scored equally),
+        falls back to NLL on the best candidate. This ensures gradient signal
+        even when the reward function provides no contrast — making the
+        mechanism model-agnostic regardless of task difficulty.
+        """
         winner_tokens, loser_tokens = trajectories
         adv_w, adv_l = advantages
 
         lp_pos = self._get_prompt_logprobs(
-            [winner_tokens, loser_tokens], self.lora_pos
+            [winner_tokens, loser_tokens], self.backend.lora_pos
         )
         lp_pos = [lp[self.prompt_len:] for lp in lp_pos]
         lp_neg = self._get_prompt_logprobs(
-            [winner_tokens, loser_tokens], self.lora_neg
+            [winner_tokens, loser_tokens], self.backend.lora_neg
         )
         lp_neg = [lp[self.prompt_len:] for lp in lp_neg]
 
@@ -387,10 +216,17 @@ class DSMeZO_Controller:
             total = sum(float(-lp) for lp in logprobs)
             return total / len(logprobs)
 
-        loss_pos = float(adv_w) * nll(lp_pos[0]) + float(adv_l) * nll(lp_pos[1])
-        loss_neg = float(adv_w) * nll(lp_neg[0]) + float(adv_l) * nll(lp_neg[1])
+        if adv_w == 0 and adv_l == 0:
+            # No reward contrast — fall back to NLL on best candidate.
+            # This reduces to supervised learning on the model's own output,
+            # providing gradient signal to improve fluency on the task.
+            loss_pos = nll(lp_pos[0])
+            loss_neg = nll(lp_neg[0])
+        else:
+            loss_pos = float(adv_w) * nll(lp_pos[0]) + float(adv_l) * nll(lp_pos[1])
+            loss_neg = float(adv_w) * nll(lp_neg[0]) + float(adv_l) * nll(lp_neg[1])
 
-        # Bug 1 fix: asymmetric GR — NLL divergence between perturbation directions
+        # Asymmetric GR — NLL divergence between perturbation directions
         total_tokens = 0
         nll_div = 0.0
         for lps_p, lps_n in zip(lp_pos, lp_neg):
@@ -398,7 +234,28 @@ class DSMeZO_Controller:
                 nll_div += (float(-p) - float(-n)) ** 2
                 total_tokens += 1
         nll_div /= total_tokens
-        loss_pos += self.lambda_gr * nll_div  # Asymmetric — only loss_pos
+        loss_pos += self.lambda_gr * nll_div
+
+        return loss_pos, loss_neg
+
+    # -- SFT Loss (§2) ------------------------------------------------------
+
+    def _compute_loss_sft(self, token_ids, prompt_len):
+        """NLL on target tokens under θ+ and θ-, with asymmetric GR."""
+        lp_pos = self._get_prompt_logprobs([token_ids], self.backend.lora_pos)[0]
+        lp_neg = self._get_prompt_logprobs([token_ids], self.backend.lora_neg)[0]
+
+        lp_pos = lp_pos[prompt_len:]
+        lp_neg = lp_neg[prompt_len:]
+
+        def nll(logprobs):
+            return -sum(float(lp) for lp in logprobs) / len(logprobs)
+
+        loss_pos = nll(lp_pos)
+        loss_neg = nll(lp_neg)
+
+        nll_div = sum((float(-p) - float(-n)) ** 2 for p, n in zip(lp_pos, lp_neg))
+        loss_pos += self.lambda_gr * nll_div / len(lp_pos)
 
         return loss_pos, loss_neg
 
@@ -416,11 +273,8 @@ class DSMeZO_Controller:
     def _explore(self, batch):
         """Generate candidates, compute RLOO advantages."""
         self._sync_adapters({}, {})
-        gen_params = SamplingParams(
-            n=self.num_candidates, temperature=self.explore_temperature
-        )
-        request_outputs = self.engine.generate(
-            batch, sampling_params=gen_params, lora_request=self.lora_pos
+        request_outputs = self.backend.generate(
+            batch, self.explore_temperature, self.num_candidates
         )
         prompt_token_ids = request_outputs[0].prompt_token_ids
 
@@ -440,7 +294,6 @@ class DSMeZO_Controller:
         adv_w = best_reward - (total_reward - best_reward) / (N - 1)
         adv_l = worst_reward - (total_reward - worst_reward) / (N - 1)
 
-        # Store reward range for entropy monitoring (applied after schedule updates)
         self._last_reward_range = best_reward - worst_reward
 
         winner_full = list(prompt_token_ids) + list(best_output.token_ids)
@@ -453,7 +306,7 @@ class DSMeZO_Controller:
 
     def _update_eps(self):
         """Scale epsilon proportionally to loss EMA."""
-        if self.loss_ema is not None and self.initial_loss_ema is not None:
+        if self.loss_ema and self.initial_loss_ema:
             ratio = max(self.loss_ema / self.initial_loss_ema, self.eps_floor)
             self.eps = self.eps_base * ratio
 
@@ -479,8 +332,12 @@ class DSMeZO_Controller:
     # -- Health Monitoring (§4.4) -------------------------------------------
 
     def _check_health(self, loss_pos, loss_neg):
-        """Spike detection — skip step if NLL > 5× EMA."""
-        avg_nll = (abs(loss_pos) + abs(loss_neg)) / 2
+        """Spike detection — skip step if NLL > 5× EMA.
+
+        Uses loss_neg for EMA tracking since it's the unbiased NLL
+        (loss_pos includes the asymmetric GR penalty).
+        """
+        avg_nll = abs(loss_neg)
         if self.loss_ema is None:
             self.loss_ema = avg_nll
             self.initial_loss_ema = avg_nll
@@ -507,24 +364,25 @@ class DSMeZO_Controller:
     def step(self, batch):
         self.step_count += 1
 
-        # Exploration with entropy-guided temperature
+        if self.mode == "sft":
+            return self._step_sft(batch)
+
+        # RL mode: AGZO + ZO-Muon
         trajectories, advantages = self._explore(batch)
 
-        # Update activation bases via power iteration
-        batch_activations = extract_layer_activations(
-            self.engine, batch, self.target_modules
-        )
+        # Activation tracking
+        batch_activations = self.backend.extract_activations(batch)
         needs_recalib = self._update_activation_bases_power_iter(batch_activations)
         if needs_recalib:
             self._calibrate_activation_bases_full(batch)
 
-        # Generate perturbations for all layers
+        # AGZO perturbation
         perturbations = {}
         for layer in self.layers:
             key = (layer["layer_idx"], layer["module_name"])
             perturbations[key] = self._get_perturbation(layer)
 
-        # Construct perturbed adapters (fused dual perturbation kernel)
+        # Dual perturbation
         pos_layers, neg_layers = {}, {}
         for layer in self.layers:
             key = (layer["layer_idx"], layer["module_name"])
@@ -536,16 +394,14 @@ class DSMeZO_Controller:
             pos_layers[key] = (pos_A, pos_B)
             neg_layers[key] = (neg_A, neg_B)
 
-        # Score (4 prefills — 2 sequences × 2 perturbation directions)
         self._sync_adapters(pos_layers, neg_layers)
         loss_pos, loss_neg = self._score_contrastive(trajectories, advantages)
 
-        # Update with safety checks
+        # SPSA + ZO-Muon update
         if self._check_health(loss_pos, loss_neg):
             raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
             dd = self._clip_dd(raw_dd)
 
-            # KL constraint — scale eta if update too large
             effective_eta = self._apply_kl_constraint(loss_pos, loss_neg)
             saved_eta = self.eta
             self.eta = effective_eta
@@ -556,7 +412,6 @@ class DSMeZO_Controller:
                 key_A = (key, "A")
                 key_B = (key, "B")
 
-                # Bug 2 fix: masking on A only, after warmup (§3.3)
                 do_mask = self.step_count > self.mask_warmup
                 zo_muon_update(layer["A"], self.momentum_buffers[key_A],
                                z_A, self.scratch_buffers[key_A],
@@ -572,7 +427,7 @@ class DSMeZO_Controller:
         self._update_eps()
         self._update_temperature()
 
-        # Entropy monitoring AFTER cosine annealing — boost persists to next step (§7.3)
+        # Entropy monitoring (§7.3)
         reward_range = self._last_reward_range
         if self.initial_entropy is None and reward_range > 0:
             self.initial_entropy = reward_range
@@ -582,15 +437,62 @@ class DSMeZO_Controller:
                 self.explore_temperature * 1.5, self.T_max
             )
 
+    def _step_sft(self, batch):
+        """SFT step: vanilla MeZO (random perturbation + SGD).
+
+        AGZO subspace and ZO-Muon orthogonalization are designed for RL's
+        high-contrast reward signal. SFT's NLL gradient is lower-variance
+        and works better with standard MeZO (Malladi et al. 2023).
+        """
+        # Random full-rank perturbation (not AGZO subspace)
+        perturbations = {}
+        for layer in self.layers:
+            key = (layer["layer_idx"], layer["module_name"])
+            z_A = torch.randn_like(layer["A"]) * self.eps
+            z_B = torch.randn_like(layer["B"]) * self.eps
+            perturbations[key] = (z_A, z_B)
+
+        # Dual perturbation
+        pos_layers, neg_layers = {}, {}
+        for layer in self.layers:
+            key = (layer["layer_idx"], layer["module_name"])
+            z_A, z_B = perturbations[key]
+            pos_layers[key] = (layer["A"] + z_A, layer["B"] + z_B)
+            neg_layers[key] = (layer["A"] - z_A, layer["B"] - z_B)
+
+        self._sync_adapters(pos_layers, neg_layers)
+        loss_pos, loss_neg = self._compute_loss_sft(
+            batch["token_ids"], batch["prompt_len"]
+        )
+
+        # Plain SGD update (no ZO-Muon orthogonalization)
+        if self._check_health(loss_pos, loss_neg):
+            dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
+
+            for layer in self.layers:
+                key = (layer["layer_idx"], layer["module_name"])
+                z_A, z_B = perturbations[key]
+                layer["A"] -= self.eta * dd * z_A
+                layer["B"] -= self.eta * dd * z_B
+
+        self._update_lr()
+
     # -- Main Training Loop -------------------------------------------------
 
-    def train(self, prompts):
-        """Train for total_steps, cycling through prompts."""
-        # Initial activation calibration using first prompt
-        self._calibrate_activation_bases_full([prompts[0]])
+    def train(self, data):
+        """Train for total_steps, cycling through data.
+
+        data: list of strings (RL mode) or list of dicts with
+              {token_ids, prompt_len, prompt_text} (SFT mode).
+        """
+        if self.mode == "sft":
+            self._calibrate_activation_bases_full([data[0]["prompt_text"]])
+        else:
+            self._calibrate_activation_bases_full([data[0]])
 
         for step_idx in range(self.total_steps):
-            batch = [prompts[step_idx % len(prompts)]]
+            sample = data[step_idx % len(data)]
+            batch = sample if self.mode == "sft" else [sample]
             self.step(batch)
 
             if (step_idx + 1) % 10 == 0:
@@ -602,11 +504,9 @@ class DSMeZO_Controller:
                     f"step={step_idx + 1}/{self.total_steps}"
                 )
 
-            # Checkpoint every 100 steps
             if (step_idx + 1) % 100 == 0:
                 self._save_checkpoint(step_idx + 1)
 
-        # Final checkpoint
         self._save_checkpoint(self.total_steps)
 
     def _save_checkpoint(self, step):
@@ -628,6 +528,6 @@ class DSMeZO_Controller:
             "explore_temperature": self.explore_temperature,
             "initial_entropy": self.initial_entropy,
         }
-        path = os.path.join(self.checkpoint_dir, f"step_{step}.pt")
+        path = os.path.join(self.backend.checkpoint_dir, f"step_{step}.pt")
         torch.save(state, path)
         print(f"Checkpoint saved: {path}")

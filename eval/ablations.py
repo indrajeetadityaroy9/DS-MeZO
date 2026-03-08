@@ -21,7 +21,10 @@ import torch
 sys.path.insert(0, "/home/ubuntu/DS-MeZO")
 
 from vllm import LLM, SamplingParams
+from ds_mezo.model_config import discover_layers
+from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
+from ds_mezo.kernels import fused_perturb_dual
 
 TOTAL_STEPS = 200
 
@@ -75,7 +78,7 @@ def score_fn(text):
         return 0
 
 
-def run_experiment(llm, name, config_overrides, patch_fn):
+def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
     """Run a single experiment: init controller, train, eval, return results."""
     torch.manual_seed(42)
     config = {
@@ -86,7 +89,8 @@ def run_experiment(llm, name, config_overrides, patch_fn):
         **config_overrides,
     }
 
-    controller = DSMeZO_Controller(llm, config)
+    backend = VLLMBackend(llm, layer_specs, config.get("rank", 16))
+    controller = DSMeZO_Controller(backend, layer_specs, config)
 
     # Memory measurement via nvidia-smi (vLLM loads model in subprocess)
     import subprocess
@@ -94,7 +98,7 @@ def run_experiment(llm, name, config_overrides, patch_fn):
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
         capture_output=True, text=True,
     )
-    mem_after_init = float(nvsmi.stdout.strip().split("\n")[0]) / 1024  # MiB → GiB
+    mem_after_init = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
 
     controller._calibrate_activation_bases_full([PROMPTS[0]])
 
@@ -118,7 +122,7 @@ def run_experiment(llm, name, config_overrides, patch_fn):
     outputs = llm.generate(
         EVAL_PROMPTS,
         SamplingParams(max_tokens=256, temperature=0.7),
-        lora_request=controller.lora_pos,
+        lora_request=backend.lora_pos,
     )
     scores = [score_fn(out.outputs[0].text) for out in outputs]
     avg_score = sum(scores) / len(scores)
@@ -134,6 +138,7 @@ def run_experiment(llm, name, config_overrides, patch_fn):
     }
 
     del controller
+    del backend
     torch.cuda.reset_peak_memory_stats()
 
     return result
@@ -147,13 +152,10 @@ def patch_sgd_momentum(controller):
 
     def patched_step(self, batch):
         self.step_count += 1
-        from ds_mezo.controller import extract_layer_activations, fused_perturb_dual
 
         trajectories, advantages = self._explore(batch)
 
-        batch_activations = extract_layer_activations(
-            self.engine, batch, self.target_modules
-        )
+        batch_activations = self.backend.extract_activations(batch)
         needs_recalib = self._update_activation_bases_power_iter(batch_activations)
         if needs_recalib:
             self._calibrate_activation_bases_full(batch)
@@ -191,8 +193,7 @@ def patch_sgd_momentum(controller):
                 key_A = (key, "A")
                 key_B = (key, "B")
 
-                # SGD+momentum: grad → momentum accumulation → param update
-                # No Newton-Schulz orthogonalization
+                # SGD+momentum: no Newton-Schulz orthogonalization
                 grad_A = dd * z_A
                 do_mask = self.step_count > self.mask_warmup
                 if do_mask:
@@ -211,7 +212,6 @@ def patch_sgd_momentum(controller):
         self._update_eps()
         self._update_temperature()
 
-        # Entropy monitoring (same as controller.step)
         reward_range = self._last_reward_range
         if self.initial_entropy is None and reward_range > 0:
             self.initial_entropy = reward_range
@@ -229,14 +229,11 @@ def patch_random_perturbation(controller):
     """Replace AGZO subspace perturbation with random orthonormal basis."""
     def patched_get_perturbation(self, layer):
         A, B = layer["A"], layer["B"]
-        key = (layer["layer_idx"], layer["module_name"])
         r_calib = self.r_calib
 
-        # Random orthonormal basis instead of activation-derived V_l
         d_in = B.shape[1]
         V_random = torch.linalg.qr(torch.randn(d_in, r_calib, device=B.device))[0]
 
-        # Same perturbation construction as original, just with random basis
         z_coeff_B = torch.randn(B.shape[0], r_calib, device=B.device)
         z_B = z_coeff_B @ V_random.T
 
@@ -298,14 +295,16 @@ def main():
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
+    # Discover layers once
+    layer_specs = discover_layers("/dev/shm/pissa_prep/residual", ["q_proj", "v_proj"])
+
     # Experiment 0: inference-only memory baseline
-    # vLLM V1 loads model in a subprocess, so we query GPU memory via nvidia-smi
     import subprocess
     nvsmi = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
         capture_output=True, text=True,
     )
-    mem_inference = float(nvsmi.stdout.strip().split("\n")[0]) / 1024  # MiB → GiB
+    mem_inference = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
     print(f"\n=== §1 Memory Baseline ===")
     print(f"  Inference VRAM (nvidia-smi): {mem_inference:.3f} GB")
 
@@ -315,7 +314,7 @@ def main():
     results = []
     for i, exp in enumerate(EXPERIMENTS):
         print(f"\n--- Experiment {i+1}/{len(EXPERIMENTS)}: {exp['name']} ---")
-        result = run_experiment(llm, exp["name"], exp["overrides"], exp["patch"])
+        result = run_experiment(llm, layer_specs, exp["name"], exp["overrides"], exp["patch"])
         results.append(result)
         print(f"  Score: {result['avg_score']:.1f} | "
               f"Loss EMA: {result['loss_ema']:.2e} | "

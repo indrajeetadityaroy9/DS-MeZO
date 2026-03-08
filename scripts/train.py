@@ -13,6 +13,8 @@ import sys
 import json
 import yaml
 from vllm import LLM
+from ds_mezo.model_config import discover_layers
+from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
 
 
@@ -29,9 +31,13 @@ def main():
         enable_lora=True,
         max_lora_rank=64,
         max_num_seqs=8,
+        enforce_eager=True,
     )
 
-    controller = DSMeZO_Controller(llm, config)
+    target_modules = config.get("target_modules", ["q_proj", "v_proj"])
+    layer_specs = discover_layers(config["model_path"], target_modules)
+    backend = VLLMBackend(llm, layer_specs, config.get("rank", 16))
+    controller = DSMeZO_Controller(backend, layer_specs, config)
     controller.train(prompts)
 
 
