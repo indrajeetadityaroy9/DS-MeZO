@@ -6,5 +6,5 @@ export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export OMP_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export TOKENIZERS_PARALLELISM=true
-export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(dirname "$(dirname "$(readlink -f "$0")")")"
-python scripts/train.py --config "$1" --prompts "$2"
+cd "$(dirname "$(dirname "$(readlink -f "$0")")")"
+python -m scripts.train --config "$1" --prompts "$2"

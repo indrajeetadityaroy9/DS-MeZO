@@ -1,24 +1,20 @@
 """DS-MeZO SFT evaluation: train on GSM8K, evaluate via perplexity.
 
-Vanilla MeZO baseline: random full-rank perturbation + SGD (no AGZO, no ZO-Muon).
+Pure SFT mode: uses the unified step pipeline (AGZO + ZO-Muon) with NLL loss.
+hybrid_switch_step = total_steps ensures no RL exploration.
 
 Primary metric: perplexity on held-out GSM8K samples (direct NLL measurement).
 Secondary metric: GSM8K exact-match (only meaningful for larger models).
 
-Usage: python eval/sft_eval.py
+Usage: python -m eval.sft_eval --model-path <path> --adapter-path <path>
 """
 
-import os
-os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-os.environ["USE_TF"] = "0"
-os.environ["TRANSFORMERS_NO_TF"] = "1"
+from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from pathlib import Path
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -63,21 +59,32 @@ def prepare_sft_data(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DS-MeZO SFT evaluation")
-    parser.add_argument("--model-path", default="/dev/shm/pissa_prep/residual")
-    parser.add_argument("--adapter-path", default="/dev/shm/pissa_prep/adapter")
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--adapter-path", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-steps", type=int, default=2000)
     parser.add_argument("--max-seq-len", type=int, default=512)
     parser.add_argument("--held-out-samples", type=int, default=50)
     args = parser.parse_args()
 
+    model_name = args.model_path.name
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read rank and target modules from adapter config
+    adapter_config = json.loads((args.adapter_path / "adapter_config.json").read_text())
+    rank = adapter_config["r"]
+    target_modules = adapter_config["target_modules"]
+
     print("=" * 70)
     print("DS-MeZO SFT EVALUATION: GSM8K")
+    print(f"Model: {model_name} | PiSSA rank-{rank}")
     print(f"Steps: {args.total_steps} | Max seq len: {args.max_seq_len}")
     print("=" * 70)
 
     # Load tokenizer and prepare data
     print("\nPreparing SFT data...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(str(args.model_path))
     train_data, held_out = prepare_sft_data(
         tokenizer, args.max_seq_len, args.held_out_samples,
     )
@@ -92,28 +99,29 @@ def main() -> None:
     print("\nLoading vLLM engine...")
     t0 = time.time()
     llm = LLM(
-        model=args.model_path,
+        model=str(args.model_path),
         dtype="bfloat16",
         gpu_memory_utilization=0.92,
         enable_lora=True,
-        max_lora_rank=64,
+        max_lora_rank=max(64, rank),
         max_num_seqs=8,
         enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
-    # Initialize controller in SFT mode
-    print("Initializing controller (SFT mode)...")
-    layer_specs = discover_layers(args.model_path, ["q_proj", "v_proj"])
-    backend = VLLMBackend(llm, layer_specs, 16)
+    # Initialize controller in pure SFT mode (hybrid_switch_step = total_steps)
+    print("Initializing controller (pure SFT)...")
+    layer_specs = discover_layers(args.model_path, target_modules)
+    backend = VLLMBackend(llm, layer_specs, rank)
     controller = DSMeZO_Controller(backend, layer_specs, {
-        "mode": "sft",
-        "adapter_path": args.adapter_path,
+        "output_dir": str(args.output_dir),
+        "adapter_path": str(args.adapter_path),
+        "model_path": str(args.model_path),
         "total_steps": args.total_steps,
+        "hybrid_switch_step": args.total_steps,  # Pure SFT: never switch to RL
         "eta_max": 1e-2,
-        "lambda_gr": 0.0,
     })
-    print(f"Layers: {controller.num_layers} | Mode: {controller.mode}")
+    print(f"Layers: {len(controller.layers)} | hybrid_switch_step: {controller.hybrid_switch_step}")
 
     # Held-out data for perplexity eval
     held_out_ids = [s["token_ids"] for s in held_out]
@@ -121,13 +129,13 @@ def main() -> None:
 
     # Pre-training baselines (with initial PiSSA adapter for fair comparison)
     print("\n--- Pre-training baselines ---")
-    controller._sync_adapters({}, {})
+    controller.backend.sync_adapters({}, {}, controller.layers)
     baseline_ppl = eval_perplexity(llm, held_out_ids, held_out_plens,
                                    lora_request=backend.lora_pos)
     print(f"  Held-out perplexity: {baseline_ppl['perplexity']:.2f} "
           f"(NLL: {baseline_ppl['avg_nll']:.4f}, {baseline_ppl['total_tokens']} tokens)")
 
-    baseline_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos, num_samples=100)
+    baseline_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos)
     print(f"  GSM8K exact_match:   {baseline_gsm8k['exact_match']:.1%} "
           f"({baseline_gsm8k['num_parsed']}/{baseline_gsm8k['num_samples']} parsed)")
 
@@ -164,14 +172,14 @@ def main() -> None:
 
     # Post-training evaluation
     print("\n--- Post-training evaluation ---")
-    controller._sync_adapters({}, {})
+    controller.backend.sync_adapters({}, {}, controller.layers)
 
     post_ppl = eval_perplexity(llm, held_out_ids, held_out_plens,
                                lora_request=backend.lora_pos)
     print(f"  Held-out perplexity: {post_ppl['perplexity']:.2f} "
           f"(NLL: {post_ppl['avg_nll']:.4f})")
 
-    post_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos, num_samples=100)
+    post_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos)
     print(f"  GSM8K exact_match:   {post_gsm8k['exact_match']:.1%} "
           f"({post_gsm8k['num_parsed']}/{post_gsm8k['num_samples']} parsed)")
 
@@ -200,12 +208,12 @@ def main() -> None:
         "training_log": log,
         "train_time_seconds": train_time,
         "total_steps": args.total_steps,
-        "mode": "sft",
+        "hybrid_switch_step": args.total_steps,
     }
-    log_path = os.path.join(os.path.dirname(__file__), "sft_results.json")
-    with open(log_path, "w") as f:
+    results_path = args.output_dir / "sft_results.json"
+    with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
-    print(f"\n  Results saved to {log_path}")
+    print(f"\n  Results saved to {results_path}")
 
 
 if __name__ == "__main__":

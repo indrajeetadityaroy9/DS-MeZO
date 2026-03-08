@@ -8,6 +8,7 @@ HuggingFace causal LM architecture.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -22,7 +23,7 @@ class LayerSpec:
 
 
 def discover_layers(
-    model_path: str, target_modules: list[str],
+    model_path: str | Path, target_modules: list[str],
 ) -> list[LayerSpec]:
     """Discover trainable layers via PyTorch model introspection.
 
@@ -30,7 +31,7 @@ def discover_layers(
     named_modules() to find nn.Linear layers matching target_modules,
     and returns LayerSpec for each (layer_idx, module) pair.
     """
-    config = AutoConfig.from_pretrained(model_path)
+    config = AutoConfig.from_pretrained(str(model_path))
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
 

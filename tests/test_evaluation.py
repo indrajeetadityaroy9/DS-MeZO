@@ -7,10 +7,7 @@ on a single GPU without vLLM.
 Usage: python tests/test_evaluation.py
 """
 
-import sys
-import os
 import math
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 from ds_mezo.kernels import zo_muon_update, fused_perturb_dual
@@ -26,22 +23,20 @@ def test_ns_orthogonality_tall():
     print("\n=== §5.2: Newton-Schulz orthogonality (tall) ===")
     torch.manual_seed(42)
     M, N = 896, 16
-    device = "cuda"
-
-    param = torch.randn(M, N, device=device)
-    buf = torch.randn(M, N, device=device)
-    z = torch.randn(M, N, device=device)
-    scratch = torch.zeros(M, N, device=device)
+    param = torch.randn(M, N, device="cuda")
+    buf = torch.randn(M, N, device="cuda")
+    z = torch.randn(M, N, device="cuda")
+    scratch = torch.zeros(M, N, device="cuda")
 
     # Run zo_muon_update — N-S result ends up in scratch before param update
     # To isolate N-S output, we set eta=0 so param doesn't change,
     # and inspect the scratch buffer which holds the orthogonalized matrix
-    zo_muon_update(param, buf, z, scratch, dd=1.0, momentum=0.9, eta=0.0, apply_mask=False)
+    zo_muon_update(param, buf, z, scratch, dd=1.0, momentum=0.9, eta=0.0, mask_scale=1.0)
 
     # scratch now holds the N-S orthogonalized matrix X_5
     X = scratch.clone()
     XtX = X.T @ X  # should be ≈ I_N
-    I_N = torch.eye(N, device=device)
+    I_N = torch.eye(N, device="cuda")
     err = (XtX - I_N).abs().max().item()
     print(f"  ||X.T @ X - I||_max = {err:.2e}")
     assert err < 1e-3, f"FAIL: orthogonality error {err:.2e} > 1e-3"
@@ -61,18 +56,18 @@ def test_ns_orthogonality_wide():
     print("\n=== §5.2: Newton-Schulz orthogonality (wide) ===")
     torch.manual_seed(42)
     M, N = 16, 896
-    device = "cuda"
 
-    param = torch.randn(M, N, device=device)
-    buf = torch.randn(M, N, device=device)
-    z = torch.randn(M, N, device=device)
-    scratch = torch.zeros(M, N, device=device)
 
-    zo_muon_update(param, buf, z, scratch, dd=1.0, momentum=0.9, eta=0.0, apply_mask=False)
+    param = torch.randn(M, N, device="cuda")
+    buf = torch.randn(M, N, device="cuda")
+    z = torch.randn(M, N, device="cuda")
+    scratch = torch.zeros(M, N, device="cuda")
+
+    zo_muon_update(param, buf, z, scratch, dd=1.0, momentum=0.9, eta=0.0, mask_scale=1.0)
 
     X = scratch.clone()
     XXt = X @ X.T  # should be ≈ I_M
-    I_M = torch.eye(M, device=device)
+    I_M = torch.eye(M, device="cuda")
     err = (XXt - I_M).abs().max().item()
     print(f"  ||X @ X.T - I||_max = {err:.2e}")
     assert err < 1e-3, f"FAIL: orthogonality error {err:.2e} > 1e-3"
@@ -91,14 +86,14 @@ def test_ns_convergence_iterations():
     print("\n=== §5.2: Newton-Schulz convergence over iterations ===")
     torch.manual_seed(42)
     M, N = 128, 16
-    device = "cuda"
 
-    G = torch.randn(M, N, device=device)
+
+    G = torch.randn(M, N, device="cuda")
     norm = G.norm("fro")
     X = G / norm
 
     errors = []
-    I_N = torch.eye(N, device=device)
+    I_N = torch.eye(N, device="cuda")
     for k in range(6):
         XtX = X.T @ X
         err = (XtX - I_N).norm("fro").item()
@@ -126,16 +121,16 @@ def test_ns_wide_tall_equivalence():
     For a matrix that could be processed either way, verify results match."""
     print("\n=== Wide/Tall N-S mathematical equivalence ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     M, N = 16, 16  # square — can use either form
 
-    G = torch.randn(M, N, device=device)
+    G = torch.randn(M, N, device="cuda")
     norm = G.norm("fro")
     X_tall = G / norm
     X_wide = G / norm
 
-    I_N = torch.eye(N, device=device)
-    I_M = torch.eye(M, device=device)
+    I_N = torch.eye(N, device="cuda")
+    I_M = torch.eye(M, device="cuda")
 
     for _ in range(5):
         X_tall = 0.5 * X_tall @ (3 * I_N - X_tall.T @ X_tall)
@@ -158,14 +153,14 @@ def test_agzo_subspace_confinement():
     Project z_B onto V_l and verify residual is zero."""
     print("\n=== §3.2: AGZO subspace confinement (B) ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     r, d_in, r_calib = 16, 896, 8
 
     # Simulate activation basis
-    V_l = torch.linalg.qr(torch.randn(d_in, r_calib, device=device))[0]
+    V_l = torch.linalg.qr(torch.randn(d_in, r_calib, device="cuda"))[0]
 
     # Generate B perturbation as in controller._get_perturbation
-    z_coeff_B = torch.randn(r, r_calib, device=device)
+    z_coeff_B = torch.randn(r, r_calib, device="cuda")
     z_B = z_coeff_B @ V_l.T  # r × d_in
 
     # Project z_B onto span(V_l): proj = z_B @ V_l @ V_l.T
@@ -188,16 +183,16 @@ def test_agzo_A_perturbation_subspace():
     activation subspace."""
     print("\n=== §3.2: AGZO subspace confinement (A) ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     d_out, r, d_in, r_calib = 896, 16, 896, 8
 
-    V_l = torch.linalg.qr(torch.randn(d_in, r_calib, device=device))[0]
-    B = torch.randn(r, d_in, device=device)
+    V_l = torch.linalg.qr(torch.randn(d_in, r_calib, device="cuda"))[0]
+    B = torch.randn(r, d_in, device="cuda")
 
     # Replicate controller logic
     BV = B @ V_l  # r × r_calib
     Q, _ = torch.linalg.qr(BV)  # r × min(r, r_calib)
-    z_coeff_A = torch.randn(d_out, Q.shape[1], device=device)
+    z_coeff_A = torch.randn(d_out, Q.shape[1], device="cuda")
     z_A = z_coeff_A @ Q.T  # d_out × r
 
     # z_A's columns should lie in span(Q)
@@ -218,59 +213,60 @@ def test_agzo_A_perturbation_subspace():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_masking_alignment():
-    """Claim (§3.3): Mask M_l = 1[sign(v_l) = sign(ĝ_l)].
-    Verify the Triton kernel applies this correctly."""
-    print("\n=== §3.3: Momentum-aligned masking ===")
+    """Claim (§3.3): Continuous masking scales gradient by mask_scale.
+    Verify the Triton kernel applies grad_tile = dd * z_tile * mask_scale."""
+    print("\n=== §3.3: Continuous cosine-similarity masking ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     M, N = 128, 16
 
-    # Set up known buf (momentum) with clear sign pattern
-    buf = torch.randn(M, N, device=device)
-    z = torch.randn(M, N, device=device)
+    buf = torch.randn(M, N, device="cuda")
+    z = torch.randn(M, N, device="cuda")
     dd = 0.5
+    mask_scale = 0.5
 
-    # Reference: compute what masked grad should be
-    grad = dd * z
-    grad_sign = torch.sign(grad)
-    buf_sign = torch.sign(buf)
-    mask = (grad_sign == buf_sign).float()
-    expected_masked_grad = grad * mask
+    # Reference: continuous masking scales the entire gradient
+    grad = dd * z * mask_scale
 
     # Reference momentum update
     momentum = 0.9
-    expected_buf = momentum * buf + (1 - momentum) * expected_masked_grad
+    expected_buf = momentum * buf + (1 - momentum) * grad
 
-    # Run Triton kernel with masking
-    param = torch.randn(M, N, device=device)
-    scratch = torch.zeros(M, N, device=device)
+    # Run Triton kernel with mask_scale=0.5
+    param = torch.randn(M, N, device="cuda")
+    scratch = torch.zeros(M, N, device="cuda")
     buf_tri = buf.clone()
-    zo_muon_update(param, buf_tri, z, scratch, dd, momentum, eta=0.0, apply_mask=True)
+    zo_muon_update(param, buf_tri, z, scratch, dd, momentum, eta=0.0, mask_scale=mask_scale)
 
     # Compare momentum buffers
     buf_diff = (expected_buf - buf_tri).abs().max().item()
-    print(f"  buf max diff (masked): {buf_diff:.2e}")
+    print(f"  buf max diff (scale=0.5): {buf_diff:.2e}")
     assert buf_diff < 1e-5, f"FAIL: masking mismatch {buf_diff:.2e}"
 
-    # Now run WITHOUT masking and verify different result
+    # Now run WITHOUT masking (mask_scale=1.0) and verify different result
     buf_no_mask = buf.clone()
-    zo_muon_update(param.clone(), buf_no_mask, z, scratch.clone(), dd, momentum, eta=0.0, apply_mask=False)
-    expected_buf_no_mask = momentum * buf + (1 - momentum) * grad
+    grad_full = dd * z
+    zo_muon_update(param.clone(), buf_no_mask, z, scratch.clone(), dd, momentum, eta=0.0, mask_scale=1.0)
+    expected_buf_no_mask = momentum * buf + (1 - momentum) * grad_full
 
     buf_diff_no_mask = (expected_buf_no_mask - buf_no_mask).abs().max().item()
-    print(f"  buf max diff (unmasked): {buf_diff_no_mask:.2e}")
+    print(f"  buf max diff (scale=1.0): {buf_diff_no_mask:.2e}")
     assert buf_diff_no_mask < 1e-5
 
-    # Verify masking actually changes the result (not trivially equal)
+    # Verify scaling actually changes the result
     mask_effect = (buf_tri - buf_no_mask).abs().max().item()
-    print(f"  mask effect (masked vs unmasked): {mask_effect:.2e}")
-    assert mask_effect > 1e-4, "FAIL: masking had no effect"
+    print(f"  scale effect (0.5 vs 1.0): {mask_effect:.2e}")
+    assert mask_effect > 1e-4, "FAIL: scaling had no effect"
 
-    # Count how many elements are masked (should be ~50% for random data)
-    frac_kept = mask.mean().item()
-    print(f"  fraction kept by mask: {frac_kept:.3f} (expect ~0.5)")
-    assert 0.3 < frac_kept < 0.7, f"FAIL: mask fraction {frac_kept:.3f} not ~50%"
-    print("  PASS: masking correctly selects gradient-momentum aligned parameters")
+    # Verify linearity: mask_scale=0 should zero the gradient contribution
+    buf_zero = buf.clone()
+    zo_muon_update(param.clone(), buf_zero, z, scratch.clone(), dd, momentum, eta=0.0, mask_scale=0.0)
+    expected_buf_zero = momentum * buf  # grad contribution is zero
+    buf_diff_zero = (expected_buf_zero - buf_zero).abs().max().item()
+    print(f"  buf max diff (scale=0.0): {buf_diff_zero:.2e}")
+    assert buf_diff_zero < 1e-5, "FAIL: scale=0 should zero gradient"
+
+    print("  PASS: continuous masking correctly scales gradient")
     return True
 
 
@@ -616,7 +612,7 @@ def test_health_spike_detection():
 
 def test_temperature_annealing():
     """Claim (§7.3): T_t follows cosine from T_max to T_min.
-    Entropy floor: if reward_range < 0.5 * initial, boost T by 1.5×."""
+    Self-certainty monitoring: if certainty rises above 0.5× initial, boost T by 1.5×."""
     print("\n=== §7.3: Temperature annealing ===")
     T_max, T_min = 1.0, 0.3
     total_steps = 1000
@@ -640,15 +636,16 @@ def test_temperature_annealing():
         assert curr <= prev + 1e-10
         prev = curr
 
-    # Entropy floor boost
-    initial_entropy = 10.0
+    # Self-certainty boost: certainty is negative (logprobs).
+    # If certainty rises above 0.5× initial (closer to 0 = overconfident), boost temp.
+    initial_certainty = -4.0  # typical initial mean max-logprob
+    certainty_ema = -1.8  # risen above 0.5 * -4.0 = -2.0 → overconfident
     current_temp = 0.5
-    reward_range = 4.0  # < 0.5 * 10 = 5.0
-    if reward_range < 0.5 * initial_entropy:
+    if initial_certainty < 0.0 and certainty_ema > initial_certainty * 0.5:
         boosted_temp = min(current_temp * 1.5, T_max)
     else:
         boosted_temp = current_temp
-    print(f"  Entropy floor: range={reward_range} < 0.5*{initial_entropy} → "
+    print(f"  Self-certainty: ema={certainty_ema} > 0.5*{initial_certainty}={initial_certainty*0.5} → "
           f"T boosted {current_temp} → {boosted_temp}")
     assert boosted_temp == 0.75
     assert boosted_temp <= T_max
@@ -659,7 +656,7 @@ def test_temperature_annealing():
     print(f"  Boost cap: {current_temp} * 1.5 = {current_temp*1.5} → capped at {T_max}")
     assert boosted_temp == T_max
 
-    print("  PASS: cosine temperature with entropy floor boost")
+    print("  PASS: cosine temperature with self-certainty monitoring")
     return True
 
 
@@ -672,20 +669,20 @@ def test_power_iteration_tracking():
     tracks evolving activation subspace. Drift = 1 - |tr(V.T @ V_old)| / r_calib."""
     print("\n=== §3.5: Power iteration subspace tracking ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     d_in, r_calib = 896, 8
 
     # Create activation matrix with known subspace
-    U_true = torch.linalg.qr(torch.randn(d_in, r_calib, device=device))[0]
-    S = torch.diag(torch.tensor([100., 50., 25., 12., 6., 3., 1.5, 0.75], device=device))
-    noise = torch.randn(100, d_in, device=device) * 0.01
-    H = noise + (torch.randn(100, r_calib, device=device) @ S @ U_true.T)
+    U_true = torch.linalg.qr(torch.randn(d_in, r_calib, device="cuda"))[0]
+    S = torch.diag(torch.tensor([100., 50., 25., 12., 6., 3., 1.5, 0.75], device="cuda"))
+    noise = torch.randn(100, d_in, device="cuda") * 0.01
+    H = noise + (torch.randn(100, r_calib, device="cuda") @ S @ U_true.T)
 
     # Full SVD baseline
     _, _, V_svd = torch.svd_lowrank(H, q=r_calib, niter=4)
 
     # Power iteration from random init
-    V = torch.linalg.qr(torch.randn(d_in, r_calib, device=device))[0]
+    V = torch.linalg.qr(torch.randn(d_in, r_calib, device="cuda"))[0]
     for _ in range(3):
         V = H.T @ (H @ V)
         V, _ = torch.linalg.qr(V)
@@ -699,11 +696,11 @@ def test_power_iteration_tracking():
     V_old = V.clone()
 
     # Rotate the activation subspace slightly
-    R = torch.linalg.qr(torch.randn(d_in, d_in, device=device))[0]
+    R = torch.linalg.qr(torch.randn(d_in, d_in, device="cuda"))[0]
     # Small rotation: mix 90% old + 10% random
     U_shifted = 0.9 * U_true + 0.1 * R[:, :r_calib]
     U_shifted, _ = torch.linalg.qr(U_shifted)
-    H_new = noise + (torch.randn(100, r_calib, device=device) @ S @ U_shifted.T)
+    H_new = noise + (torch.randn(100, r_calib, device="cuda") @ S @ U_shifted.T)
 
     V_new = V.clone()
     for _ in range(3):
@@ -715,8 +712,8 @@ def test_power_iteration_tracking():
     assert drift_alignment > 0.8, "Small shift should maintain reasonable alignment"
 
     # Large shift — should trigger recalibration
-    U_random = torch.linalg.qr(torch.randn(d_in, r_calib, device=device))[0]
-    H_random = torch.randn(100, r_calib, device=device) @ S @ U_random.T
+    U_random = torch.linalg.qr(torch.randn(d_in, r_calib, device="cuda"))[0]
+    H_random = torch.randn(100, r_calib, device="cuda") @ S @ U_random.T
     V_drift = V.clone()
     for _ in range(3):
         V_drift = H_random.T @ (H_random @ V_drift)
@@ -740,14 +737,14 @@ def test_pissa_decomposition():
     """Claim (§3.1): W0 = A @ B + W_res, where A = U * sqrt(S), B = sqrt(S) * V.T."""
     print("\n=== §3.1: PiSSA decomposition ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     d_out, d_in, rank = 896, 896, 16
 
-    W0 = torch.randn(d_out, d_in, device=device)
+    W0 = torch.randn(d_out, d_in, device="cuda")
     U, S, V = torch.svd_lowrank(W0.float(), q=rank, niter=2)
-    sqrt_S = torch.sqrt(S[:rank])
-    A = U[:, :rank] * sqrt_S.unsqueeze(0)          # d_out × r
-    B = (sqrt_S.unsqueeze(1) * V.T[:rank, :]).contiguous()  # r × d_in
+    sqrt_S = torch.sqrt(S)
+    A = U * sqrt_S.unsqueeze(0)                     # d_out × r
+    B = (sqrt_S.unsqueeze(1) * V.T).contiguous()    # r × d_in
     W_res = W0 - A @ B
 
     # Reconstruction error
@@ -782,21 +779,21 @@ def test_spsa_gradient_estimation():
     For a quadratic f(θ) = 0.5 * θ.T @ H @ θ, true gradient is H @ θ."""
     print("\n=== §2: SPSA gradient estimation accuracy ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     d = 256
 
     # Quadratic objective with known gradient
-    H = torch.randn(d, d, device=device)
+    H = torch.randn(d, d, device="cuda")
     H = H.T @ H  # positive definite
-    theta = torch.randn(d, device=device)
+    theta = torch.randn(d, device="cuda")
     true_grad = H @ theta
 
     # SPSA estimation (average over K directions)
     K = 200
     eps = 1e-3
-    grad_est = torch.zeros(d, device=device)
+    grad_est = torch.zeros(d, device="cuda")
     for _ in range(K):
-        z = torch.randn(d, device=device)
+        z = torch.randn(d, device="cuda")
         theta_plus = theta + eps * z
         theta_minus = theta - eps * z
         f_plus = 0.5 * theta_plus @ H @ theta_plus
@@ -826,24 +823,24 @@ def test_zo_muon_spectral_denoising():
     direction should align with the dominant singular vector of accumulated grads."""
     print("\n=== §5.2: ZO-Muon spectral denoising ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     M, N = 128, 16
 
-    param = torch.randn(M, N, device=device)
-    buf = torch.zeros(M, N, device=device)
-    scratch = torch.zeros(M, N, device=device)
+    param = torch.randn(M, N, device="cuda")
+    buf = torch.zeros(M, N, device="cuda")
+    scratch = torch.zeros(M, N, device="cuda")
     momentum = 0.9
 
     # Simulate 20 noisy gradient estimates with a dominant direction
-    true_dir = torch.randn(M, N, device=device)
+    true_dir = torch.randn(M, N, device="cuda")
     true_dir /= true_dir.norm("fro")
 
     for step in range(20):
-        noise = torch.randn(M, N, device=device) * 0.5
+        noise = torch.randn(M, N, device="cuda") * 0.5
         z = true_dir + noise
         param_copy = param.clone()
         zo_muon_update(param_copy, buf, z, scratch, dd=1.0, momentum=momentum,
-                       eta=0.0, apply_mask=False)
+                       eta=0.0, mask_scale=1.0)
 
     # After momentum accumulation, buf should be aligned with true_dir
     buf_normalized = buf / buf.norm("fro")
@@ -854,10 +851,10 @@ def test_zo_muon_spectral_denoising():
     # The N-S orthogonalized output should have orthonormal structure
     # Run one more update and check scratch
     zo_muon_update(param.clone(), buf.clone(), true_dir, scratch,
-                   dd=1.0, momentum=momentum, eta=0.0, apply_mask=False)
+                   dd=1.0, momentum=momentum, eta=0.0, mask_scale=1.0)
     X = scratch
     XtX = X.T @ X
-    I_N = torch.eye(N, device=device)
+    I_N = torch.eye(N, device="cuda")
     orth_err = (XtX - I_N).abs().max().item()
     print(f"  N-S orthogonality error: {orth_err:.2e}")
     assert orth_err < 1e-3
@@ -874,11 +871,11 @@ def test_fused_perturb_dual_correctness():
     """Verify fused_perturb_dual computes pos=base+z and neg=base-z exactly."""
     print("\n=== §6.1: Fused dual perturbation correctness ===")
     torch.manual_seed(42)
-    device = "cuda"
+
 
     for shape in [(896, 16), (16, 896), (128, 16)]:
-        base = torch.randn(*shape, device=device)
-        z = torch.randn(*shape, device=device)
+        base = torch.randn(*shape, device="cuda")
+        z = torch.randn(*shape, device="cuda")
         pos = torch.empty_like(base)
         neg = torch.empty_like(base)
 
@@ -900,50 +897,50 @@ def test_fused_perturb_dual_correctness():
 
 def test_masking_a_only():
     """Claim (§3.3): Masking applied to A matrices only.
-    B matrices always use apply_mask=False."""
+    B matrices always use mask_scale=1.0."""
     print("\n=== §3.3: Masking on A only, not B ===")
     torch.manual_seed(42)
-    device = "cuda"
+
 
     # Simulate the controller's update loop logic
     # A: do_mask = step > mask_warmup (True after warmup)
-    # B: always apply_mask=False
+    # B: always mask_scale=1.0
 
     # Create distinct param/buf for A and B
     M_A, N_A = 896, 16  # A shape (tall)
     M_B, N_B = 16, 896  # B shape (wide)
 
-    param_A = torch.randn(M_A, N_A, device=device)
-    buf_A = torch.randn(M_A, N_A, device=device)
-    z_A = torch.randn(M_A, N_A, device=device)
-    scratch_A = torch.zeros(M_A, N_A, device=device)
+    param_A = torch.randn(M_A, N_A, device="cuda")
+    buf_A = torch.randn(M_A, N_A, device="cuda")
+    z_A = torch.randn(M_A, N_A, device="cuda")
+    scratch_A = torch.zeros(M_A, N_A, device="cuda")
 
-    param_B = torch.randn(M_B, N_B, device=device)
-    buf_B = torch.randn(M_B, N_B, device=device)
-    z_B = torch.randn(M_B, N_B, device=device)
-    scratch_B = torch.zeros(M_B, N_B, device=device)
+    param_B = torch.randn(M_B, N_B, device="cuda")
+    buf_B = torch.randn(M_B, N_B, device="cuda")
+    z_B = torch.randn(M_B, N_B, device="cuda")
+    scratch_B = torch.zeros(M_B, N_B, device="cuda")
 
     # Run with masking on A, no masking on B (as controller does)
     buf_A_masked = buf_A.clone()
     zo_muon_update(param_A.clone(), buf_A_masked, z_A, scratch_A.clone(),
-                   dd=0.5, momentum=0.9, eta=1e-4, apply_mask=True)
+                   dd=0.5, momentum=0.9, eta=1e-4, mask_scale=0.5)
 
     buf_A_unmasked = buf_A.clone()
     zo_muon_update(param_A.clone(), buf_A_unmasked, z_A, scratch_A.clone(),
-                   dd=0.5, momentum=0.9, eta=1e-4, apply_mask=False)
+                   dd=0.5, momentum=0.9, eta=1e-4, mask_scale=1.0)
 
     # Verify A masking changes the result
     a_diff = (buf_A_masked - buf_A_unmasked).abs().max().item()
     print(f"  A: masked vs unmasked buf diff = {a_diff:.2e} (should be > 0)")
     assert a_diff > 1e-4, "FAIL: masking should change A's result"
 
-    # Verify B is always unmasked (controller passes apply_mask=False)
+    # Verify B is always unmasked (controller passes mask_scale=1.0)
     buf_B1 = buf_B.clone()
     buf_B2 = buf_B.clone()
     zo_muon_update(param_B.clone(), buf_B1, z_B, scratch_B.clone(),
-                   dd=0.5, momentum=0.9, eta=1e-4, apply_mask=False)
+                   dd=0.5, momentum=0.9, eta=1e-4, mask_scale=1.0)
     zo_muon_update(param_B.clone(), buf_B2, z_B, scratch_B.clone(),
-                   dd=0.5, momentum=0.9, eta=1e-4, apply_mask=False)
+                   dd=0.5, momentum=0.9, eta=1e-4, mask_scale=1.0)
     b_diff = (buf_B1 - buf_B2).abs().max().item()
     print(f"  B: two unmasked runs diff = {b_diff:.2e} (should be 0)")
     assert b_diff < 1e-10, "FAIL: identical runs should match"
@@ -960,12 +957,12 @@ def test_momentum_formula():
     """Claim (§5.2): Momentum: G_t = μ·G_{t-1} + (1-μ)·ĝ_t."""
     print("\n=== §5.2: Momentum accumulation formula ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     M, N = 128, 16
     momentum = 0.9
 
-    buf = torch.randn(M, N, device=device)
-    z = torch.randn(M, N, device=device)
+    buf = torch.randn(M, N, device="cuda")
+    z = torch.randn(M, N, device="cuda")
     dd = 0.5
 
     buf_ref = buf.clone()
@@ -973,10 +970,10 @@ def test_momentum_formula():
     expected_buf = momentum * buf_ref + (1 - momentum) * grad
 
     buf_tri = buf.clone()
-    param = torch.randn(M, N, device=device)
-    scratch = torch.zeros(M, N, device=device)
+    param = torch.randn(M, N, device="cuda")
+    scratch = torch.zeros(M, N, device="cuda")
     zo_muon_update(param, buf_tri, z, scratch, dd=dd, momentum=momentum,
-                   eta=0.0, apply_mask=False)
+                   eta=0.0, mask_scale=1.0)
 
     diff = (buf_tri - expected_buf).abs().max().item()
     print(f"  max |buf_triton - buf_expected| = {diff:.2e}")
@@ -994,27 +991,27 @@ def test_param_update_direction():
     Verify the param changes by exactly eta * orthogonalized direction."""
     print("\n=== §5.2: Parameter update direction ===")
     torch.manual_seed(42)
-    device = "cuda"
+
     M, N = 128, 16
     eta = 1e-4
 
-    param = torch.randn(M, N, device=device)
-    buf = torch.randn(M, N, device=device)
-    z = torch.randn(M, N, device=device)
+    param = torch.randn(M, N, device="cuda")
+    buf = torch.randn(M, N, device="cuda")
+    z = torch.randn(M, N, device="cuda")
 
     # First get N-S output by running with eta=0
-    scratch = torch.zeros(M, N, device=device)
+    scratch = torch.zeros(M, N, device="cuda")
     buf_copy = buf.clone()
     zo_muon_update(param.clone(), buf_copy, z, scratch, dd=1.0, momentum=0.9,
-                   eta=0.0, apply_mask=False)
+                   eta=0.0, mask_scale=1.0)
     ns_output = scratch.clone()
 
     # Now run with actual eta
-    scratch2 = torch.zeros(M, N, device=device)
+    scratch2 = torch.zeros(M, N, device="cuda")
     param_before = param.clone()
     buf_copy2 = buf.clone()
     zo_muon_update(param, buf_copy2, z, scratch2, dd=1.0, momentum=0.9,
-                   eta=eta, apply_mask=False)
+                   eta=eta, mask_scale=1.0)
 
     # param should have changed by -eta * ns_output
     expected_param = param_before - eta * ns_output

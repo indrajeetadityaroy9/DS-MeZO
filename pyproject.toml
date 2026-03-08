@@ -22,4 +22,4 @@ ds-mezo-train = "scripts.train:main"
 ds-mezo-pissa = "scripts.prepare_pissa:main"
 
 [tool.setuptools.packages.find]
-include = ["ds_mezo*"]
+include = ["ds_mezo*", "eval*", "scripts*", "tests*"]

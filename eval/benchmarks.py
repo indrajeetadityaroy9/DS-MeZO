@@ -1,11 +1,18 @@
 """Standard benchmarks for DS-MeZO evaluation.
 
-Uses evaluate (HuggingFace) for metrics and datasets for data loading.
-All benchmarks use vLLM for generation via the engine passed at call time.
+Follows canonical evaluation protocols from authoritative harnesses:
+- HumanEval: openai/human-eval (Chen et al. 2021, Codex paper §2-3)
+- MBPP: bigcode-evaluation-harness (zero-shot docstring format, sanitized split)
+- GSM8K: lm-evaluation-harness (8-shot CoT, two-stage answer extraction)
+- Perplexity: conditional NLL on held-out completion tokens via prefill logprobs
+
+Protocol parameters (n_samples, temperature) are required arguments —
+callers specify them explicitly via CLI args.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from typing import Any
@@ -13,6 +20,8 @@ from typing import Any
 import evaluate
 from datasets import load_dataset
 from vllm import SamplingParams
+
+from eval.utils import extract_code, pass_at_k
 
 
 # ---------------------------------------------------------------------------
@@ -27,8 +36,8 @@ def eval_perplexity(
 ) -> dict[str, float | int]:
     """Per-token perplexity on held-out sequences.
 
-    Measures NLL via prefill logprobs, reports perplexity = exp(avg NLL).
-    This is the most direct measure of SFT effectiveness.
+    Measures NLL via prefill logprobs on completion tokens (after prompt_len).
+    Reports perplexity = exp(avg NLL).
     """
     score_params = SamplingParams(max_tokens=1, prompt_logprobs=1, temperature=0.0)
     prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
@@ -37,68 +46,110 @@ def eval_perplexity(
     )
 
     total_nll, total_tokens = 0.0, 0
-    num_samples = 0
     for out, seq, plen in zip(outputs, token_sequences, prompt_lens):
-        sample_nll = 0.0
-        n_completion = 0
-        for i, token_lp in enumerate(out.prompt_logprobs[1:], 1):
-            if i < plen:
-                continue
-            tok_id = seq[i]
-            lp = token_lp[tok_id].logprob
-            sample_nll += -lp
-            n_completion += 1
-        if n_completion > 0:
-            total_nll += sample_nll
-            total_tokens += n_completion
-            num_samples += 1
+        # Completion tokens only: skip prompt positions (logprobs[0] is None, so [1:] → index 1..N)
+        for i in range(plen, len(out.prompt_logprobs)):
+            total_nll += -out.prompt_logprobs[i][seq[i]].logprob
+            total_tokens += 1
 
-    avg_nll = total_nll / max(total_tokens, 1)
+    avg_nll = total_nll / total_tokens
     return {
         "perplexity": math.exp(avg_nll),
         "avg_nll": avg_nll,
         "total_tokens": total_tokens,
-        "num_samples": num_samples,
     }
 
 
 # ---------------------------------------------------------------------------
-# GSM8K — math reasoning, exact match on final numerical answer
+# GSM8K — 8-shot CoT, two-stage answer extraction, exact match
 # ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def _get_gsm8k_fewshot(n_shot: int = 8) -> tuple[dict, ...]:
+    """Load n_shot demonstrations from GSM8K train split.
+
+    Uses the first n_shot training examples as few-shot demonstrations.
+    Standard protocol: 8-shot CoT (Wei et al. 2022, lm-evaluation-harness).
+    Returns tuple (hashable for lru_cache).
+    """
+    train = load_dataset("openai/gsm8k", "main", split="train")
+    return tuple(dict(row) for row in train.select(range(n_shot)))
+
+
+def _build_gsm8k_prompt(question: str, fewshot: tuple[dict, ...]) -> str:
+    """Build GSM8K prompt with 8-shot CoT demonstrations.
+
+    Format: Q:/A: with full chain-of-thought gold answers from the train split.
+    Follows lm-evaluation-harness canonical format.
+    """
+    parts = []
+    for ex in fewshot:
+        parts.append(f"Q: {ex['question']}\nA: {ex['answer']}")
+    parts.append(f"Q: {question}\nA:")
+    return "\n\n".join(parts)
+
+
+def _extract_gsm8k_answer(text: str) -> str:
+    """Two-stage GSM8K answer extraction (lm-evaluation-harness protocol).
+
+    Stage 1: "The answer is X" — model-generated conclusion format.
+    Stage 2: "#### X" — dataset gold format (exactly 4 hashes; 3 hashes is
+             a markdown header and must not match).
+    Stage 3: Last integer in the text — desperation fallback.
+    """
+    # Stage 1: "The answer is X"
+    m = re.search(r"[Tt]he answer is\s*\$?\s*(-?[\d,]+)", text)
+    if m:
+        return m.group(1).replace(",", "")
+
+    # Stage 2: exactly 4 hashes (####), not 3 (### = markdown header)
+    m = re.search(r"####\s*(-?[\d,]+)", text)
+    if m:
+        return m.group(1).replace(",", "")
+
+    # Stage 3: last integer
+    nums = re.findall(r"-?\d+", text)
+    return nums[-1] if nums else ""
+
 
 def eval_gsm8k(
     engine: Any,
     lora_request: Any = None,
     num_samples: int | None = None,
 ) -> dict[str, Any]:
-    """GSM8K exact-match accuracy.
+    """GSM8K exact-match accuracy with 8-shot CoT prompting.
 
-    Generates chain-of-thought solutions, extracts final answer via #### pattern,
-    compares to ground truth using evaluate.exact_match.
+    Default evaluates full test set (1319 problems). num_samples can be set
+    for development but should be None for ICML reporting.
+
+    Protocol:
+    - 8-shot CoT demonstrations from train split
+    - Greedy decoding (temperature=0)
+    - Stop at "Q:" to prevent multi-turn generation
+    - Two-stage answer extraction
+    - Exact match after comma removal
     """
     dataset = load_dataset("openai/gsm8k", "main", split="test")
     if num_samples:
-        dataset = dataset.select(range(min(num_samples, len(dataset))))
+        dataset = dataset.select(range(num_samples))
 
     exact_match = evaluate.load("exact_match")
 
-    prompts = [
-        f"Question: {row['question']}\nAnswer: Let's solve step by step.\n"
-        for row in dataset
-    ]
+    fewshot = _get_gsm8k_fewshot()
+    prompts = [_build_gsm8k_prompt(row["question"], fewshot) for row in dataset]
+
+    # Greedy with stop at "Q:" prevents multi-turn generation
+    # max_tokens=512: standard CoT generation budget
     outputs = engine.generate(
         prompts,
-        SamplingParams(max_tokens=512, temperature=0.0),
+        SamplingParams(max_tokens=512, temperature=0.0, stop=["Q:", "\n\n\n"]),
         lora_request=lora_request,
     )
 
     predictions, references = [], []
     for out, row in zip(outputs, dataset):
-        pred_match = re.search(r"####?\s*(-?[\d,]+)", out.outputs[0].text)
-        ref_match = re.search(r"####?\s*(-?[\d,]+)", row["answer"])
-        predictions.append(
-            pred_match.group(1).replace(",", "") if pred_match else ""
-        )
+        predictions.append(_extract_gsm8k_answer(out.outputs[0].text))
+        ref_match = re.search(r"####\s*(-?[\d,]+)", row["answer"])
         references.append(ref_match.group(1).replace(",", ""))
 
     result = exact_match.compute(predictions=predictions, references=references)
@@ -108,160 +159,158 @@ def eval_gsm8k(
 
 
 # ---------------------------------------------------------------------------
-# MMLU — knowledge, multiple-choice via logprob comparison
+# MBPP — zero-shot docstring format, pass@k via execution
 # ---------------------------------------------------------------------------
 
-def eval_mmlu(
-    engine: Any,
-    tokenizer: Any,
-    lora_request: Any = None,
-    num_samples: int | None = None,
-) -> dict[str, Any]:
-    """MMLU accuracy via batched logprob comparison for A/B/C/D choices.
+def load_mbpp_train() -> list[dict[str, Any]]:
+    """Load MBPP sanitized train split with prompts and test metadata."""
+    dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+    return [
+        {
+            "prompt": build_mbpp_prompt(row),
+            "test_list": row["test_list"],
+            "test_imports": row["test_imports"],
+        }
+        for row in dataset
+    ]
 
-    Uses evaluate.accuracy for the metric. Scores each choice by computing
-    the logprob of the answer token after the prompt.
+
+def build_mbpp_prompt(row: dict) -> str:
+    """Build MBPP prompt in bigcode-evaluation-harness docstring format.
+
+    Canonical zero-shot format: task description + first test assertion as docstring.
     """
-    dataset = load_dataset("cais/mmlu", "all", split="test")
-    if num_samples:
-        dataset = dataset.select(range(min(num_samples, len(dataset))))
+    return f'"""\n{row["prompt"]}\n{row["test_list"][0]}\n"""\n'
 
-    accuracy = evaluate.load("accuracy")
-    score_params = SamplingParams(max_tokens=1, prompt_logprobs=1, temperature=0.0)
-    choices = ["A", "B", "C", "D"]
 
-    # Build all sequences for all samples in one batch
-    all_seqs: list[list[int]] = []
-    for row in dataset:
-        prompt = f"Question: {row['question']}\n"
-        for i, c in enumerate(choices):
-            prompt += f"{c}. {row['choices'][i]}\n"
-        prompt += "Answer:"
+def eval_mbpp(
+    engine: Any,
+    lora_request: Any,
+    n_samples: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """MBPP pass@k via code execution (sanitized split).
 
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    Protocol (bigcode-evaluation-harness):
+    - Zero-shot docstring prompt with first test assertion
+    - Stop sequences prevent extraneous generation
+    - Nucleus sampling (top_p=0.95) when temperature > 0 (Codex paper §3.2)
+    - Execution via HuggingFace code_eval with sandboxing
+    - Unbiased pass@k estimator (Chen et al. 2021, Eq. 1)
+    """
+    dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+    code_eval = evaluate.load("code_eval")
 
-        for c in choices:
-            choice_ids = tokenizer.encode(f" {c}", add_special_tokens=False)
-            all_seqs.append(prompt_ids + choice_ids)
+    prompts = [build_mbpp_prompt(row) for row in dataset]
 
-    # Single batched engine call
-    seq_prompts = [{"prompt_token_ids": seq} for seq in all_seqs]
-    outputs = engine.generate(
-        seq_prompts, sampling_params=score_params, lora_request=lora_request,
+    # Stop sequences from bigcode-evaluation-harness
+    stop = ["\nclass", "\nassert", '\n"""', "\nprint", "\nif"]
+
+    # Codex paper §3.2: top_p=0.95 nucleus sampling for temperature > 0
+    gen_params = SamplingParams(
+        max_tokens=512, temperature=temperature, n=n_samples,
+        stop=stop, **({"top_p": 0.95} if temperature > 0 else {}),
     )
 
-    # Collect logprobs per sample
-    predictions: list[int] = []
-    references: list[int] = []
-    num_choices = len(choices)
-    for sample_idx, row in enumerate(dataset):
-        best_choice, best_lp = 0, float("-inf")
-        base = sample_idx * num_choices
-        for i in range(num_choices):
-            out = outputs[base + i]
-            seq = all_seqs[base + i]
-            last_lp = out.prompt_logprobs[-1]
-            tok_id = seq[-1]
-            lp = last_lp[tok_id].logprob
-            if lp > best_lp:
-                best_lp, best_choice = lp, i
+    outputs = engine.generate(prompts, gen_params, lora_request=lora_request)
 
-        predictions.append(best_choice)
-        references.append(row["answer"])
+    predictions: list[list[str]] = []
+    references: list[str] = []
+    for out, row in zip(outputs, dataset):
+        completions = [extract_code(o.text) for o in out.outputs]
+        predictions.append(completions)
+        imports = "\n".join(row["test_imports"])
+        tests = "\n".join(row["test_list"])
+        references.append(f"{imports}\n{tests}")
 
-    result = accuracy.compute(predictions=predictions, references=references)
-    result["num_samples"] = len(dataset)
+    _, results_list = code_eval.compute(
+        references=references, predictions=predictions,
+    )
+
+    per_task_correct = [sum(r[1] for r in task) for task in results_list]
+    per_task_n = [len(task) for task in results_list]
+
+    pass_1 = sum(
+        pass_at_k(n, c, 1) for n, c in zip(per_task_n, per_task_correct)
+    ) / len(dataset)
+
+    result = {
+        "pass@1": pass_1,
+        "per_task_correct": per_task_correct,
+        "per_task_n": per_task_n,
+        "num_tasks": len(dataset),
+    }
+
+    if n_samples >= 10:
+        result["pass@10"] = sum(
+            pass_at_k(n, c, 10) for n, c in zip(per_task_n, per_task_correct)
+        ) / len(dataset)
+
     return result
 
 
 # ---------------------------------------------------------------------------
-# Shared code completion trimming
-# ---------------------------------------------------------------------------
-
-def _trim_code_completion(text: str) -> str:
-    """Stop at end of code block or first non-indented non-definition line."""
-    lines = text.split("\n")
-    trimmed: list[str] = []
-    for line in lines:
-        if line.strip() == "```":
-            break
-        if trimmed and line.strip() and not line.startswith(" ") and not line.startswith("\t"):
-            if not line.startswith("def ") and not line.startswith("class "):
-                break
-        trimmed.append(line)
-    return "\n".join(trimmed)
-
-
-# ---------------------------------------------------------------------------
-# HumanEval — code generation, pass@1 via execution
+# HumanEval — function completion, pass@k via execution
 # ---------------------------------------------------------------------------
 
 def eval_humaneval(
-    engine: Any, lora_request: Any = None,
+    engine: Any,
+    lora_request: Any,
+    n_samples: int,
+    temperature: float,
 ) -> dict[str, Any]:
-    """HumanEval pass@1 via evaluate.code_eval.
+    """HumanEval pass@k via code execution.
 
-    Generates function completions, executes with test cases in sandbox.
+    Protocol (openai/human-eval, Codex paper §2-3):
+    - Prompt = function signature + docstring (canonical, from dataset)
+    - Completion concatenated with prompt before execution
+    - Stop sequences without trailing spaces (Codex paper + bigcode-harness)
+    - Nucleus sampling (top_p=0.95) when temperature > 0
+    - Unbiased pass@k estimator (Chen et al. 2021, Eq. 1)
     """
     dataset = load_dataset("openai/openai_humaneval", split="test")
     code_eval = evaluate.load("code_eval")
 
     prompts = [row["prompt"] for row in dataset]
-    outputs = engine.generate(
-        prompts,
-        SamplingParams(max_tokens=512, temperature=0.0),
-        lora_request=lora_request,
+
+    # Codex paper stop sequences (no trailing spaces) + bigcode-harness additions
+    stop = ["\nclass", "\ndef", "\n#", "\nif", "\nprint"]
+
+    gen_params = SamplingParams(
+        max_tokens=512, temperature=temperature, n=n_samples,
+        stop=stop, **({"top_p": 0.95} if temperature > 0 else {}),
     )
 
-    test_cases: list[str] = []
-    predictions: list[list[str]] = []
-    for out, row in zip(outputs, dataset):
-        predictions.append([_trim_code_completion(out.outputs[0].text)])
-        test_cases.append(row["test"] + f"\ncheck({row['entry_point']})")
-
-    metrics, _ = code_eval.compute(
-        references=test_cases,
-        predictions=predictions,
-    )
-    metrics["num_samples"] = len(dataset)
-    return metrics
-
-
-# ---------------------------------------------------------------------------
-# MBPP — code generation, pass@1 via execution
-# ---------------------------------------------------------------------------
-
-def eval_mbpp(
-    engine: Any, lora_request: Any = None,
-) -> dict[str, Any]:
-    """MBPP pass@1 via evaluate.code_eval.
-
-    Generates Python functions from natural language descriptions,
-    executes against assertion-based test cases.
-    """
-    dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
-    code_eval = evaluate.load("code_eval")
-
-    prompts: list[str] = []
-    for row in dataset:
-        func_match = re.search(r'(?:assert\s+(?:not\s+)?(?:\()?\s*)(\w+)\s*\(', row['test_list'][0])
-        func_name = func_match.group(1) if func_match else "solution"
-        prompts.append(f"Write a Python function named `{func_name}`.\n\n"
-                       f"{row['prompt']}\n\n```python\n")
-
-    outputs = engine.generate(
-        prompts, SamplingParams(max_tokens=512, temperature=0.0),
-        lora_request=lora_request,
-    )
+    outputs = engine.generate(prompts, gen_params, lora_request=lora_request)
 
     predictions: list[list[str]] = []
     references: list[str] = []
     for out, row in zip(outputs, dataset):
-        predictions.append([_trim_code_completion(out.outputs[0].text)])
-        imports = "\n".join(row["test_imports"])
-        tests = "\n".join(row["test_list"])
-        references.append(f"{imports}\n{tests}" if imports else tests)
+        completions = [row["prompt"] + o.text for o in out.outputs]
+        predictions.append(completions)
+        references.append(row["test"] + f"\ncheck({row['entry_point']})")
 
-    metrics, _ = code_eval.compute(references=references, predictions=predictions)
-    metrics["num_samples"] = len(dataset)
-    return metrics
+    _, results_list = code_eval.compute(
+        references=references, predictions=predictions,
+    )
+
+    per_task_correct = [sum(r[1] for r in task) for task in results_list]
+    per_task_n = [len(task) for task in results_list]
+
+    pass_1 = sum(
+        pass_at_k(n, c, 1) for n, c in zip(per_task_n, per_task_correct)
+    ) / len(dataset)
+
+    result = {
+        "pass@1": pass_1,
+        "per_task_correct": per_task_correct,
+        "per_task_n": per_task_n,
+        "num_tasks": len(dataset),
+    }
+
+    if n_samples >= 10:
+        result["pass@10"] = sum(
+            pass_at_k(n, c, 10) for n, c in zip(per_task_n, per_task_correct)
+        ) / len(dataset)
+
+    return result

@@ -1,11 +1,24 @@
 """Triton kernels for DS-MeZO controller operations.
 
-Kernel 1: zo_muon_update — fuses gradient computation, momentum-aligned
-    masking, momentum accumulation, Newton-Schulz orthogonalization (5 iter),
-    and parameter update into a single kernel launch per matrix.
+Kernel 1: zo_muon_update — fuses gradient computation, continuous cosine-
+    similarity masking, momentum accumulation, Newton-Schulz orthogonalization
+    (5 iter), and parameter update into a single kernel launch per matrix.
 
 Kernel 2: fused_perturb_dual — computes both θ+ = base + z and
     θ- = base - z in a single pass (halves memory traffic).
+
+Invariant constants (all mathematically fixed, not tunable):
+    - Newton-Schulz iteration: X_{k+1} = 0.5 * X_k @ (3I - X_k^T @ X_k)
+      The 3.0 and 0.5 are exact Padé approximation coefficients for the
+      matrix sign function. Changing them breaks convergence guarantees.
+    - 5 iterations: cubic convergence from Frobenius-normalized initialization
+      means error ∝ ε₀^(3^5) = ε₀^243. For ε₀ ≈ 0.1 (typical after
+      normalization), this is exact to machine precision.
+    - 1e-16 norm floor: below FP32 machine epsilon (1.19e-7). Prevents
+      division by zero without affecting any representable value.
+    - BLOCK_M=128, BLOCK_N=128: GPU SRAM tile sizes matched to H100 L2
+      cache geometry (power-of-2 alignment). BLOCK=1024 for elementwise
+      ops saturates memory bandwidth. These are hardware constants.
 
 Reference: DS_MeZO_Combined.md §5.2, §6.1
 """
@@ -25,7 +38,7 @@ def _zo_muon_tall_kernel(
     M, N: tl.constexpr,
     stride_m, stride_n,
     dd, momentum, eta,
-    APPLY_MASK: tl.constexpr,
+    mask_scale,
     BLOCK_M: tl.constexpr,
 ):
     """ZO-Muon update for tall matrices (M >= N). Tiles along M rows.
@@ -34,7 +47,7 @@ def _zo_muon_tall_kernel(
     offs_n = tl.arange(0, N)
     num_chunks = tl.cdiv(M, BLOCK_M)
 
-    # ── Pass 1: grad + masking + momentum + Frobenius norm ────────────
+    # ── Pass 1: grad + continuous masking + momentum + Frobenius norm ─
     norm_sq = tl.zeros([1], dtype=tl.float32)
 
     for chunk in range(num_chunks):
@@ -44,14 +57,8 @@ def _zo_muon_tall_kernel(
         ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
 
         z_tile = tl.load(z_ptr + ptrs, mask=mask, other=0.0)
-        grad_tile = dd * z_tile
+        grad_tile = dd * z_tile * mask_scale
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
-
-        if APPLY_MASK:
-            grad_sign = tl.where(grad_tile > 0, 1.0, tl.where(grad_tile < 0, -1.0, 0.0))
-            buf_sign = tl.where(buf_tile > 0, 1.0, tl.where(buf_tile < 0, -1.0, 0.0))
-            align_mask = (grad_sign == buf_sign).to(tl.float32)
-            grad_tile = grad_tile * align_mask
 
         buf_tile = momentum * buf_tile + (1.0 - momentum) * grad_tile
         tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
@@ -113,7 +120,7 @@ def _zo_muon_wide_kernel(
     M: tl.constexpr, N,
     stride_m, stride_n,
     dd, momentum, eta,
-    APPLY_MASK: tl.constexpr,
+    mask_scale,
     BLOCK_N: tl.constexpr,
 ):
     """ZO-Muon update for wide matrices (M < N). Tiles along N columns.
@@ -123,7 +130,7 @@ def _zo_muon_wide_kernel(
     offs_m = tl.arange(0, M)
     num_chunks = tl.cdiv(N, BLOCK_N)
 
-    # ── Pass 1: grad + masking + momentum + Frobenius norm ────────────
+    # ── Pass 1: grad + continuous masking + momentum + Frobenius norm ─
     norm_sq = tl.zeros([1], dtype=tl.float32)
 
     for chunk in range(num_chunks):
@@ -133,14 +140,8 @@ def _zo_muon_wide_kernel(
         ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
 
         z_tile = tl.load(z_ptr + ptrs, mask=mask, other=0.0)
-        grad_tile = dd * z_tile
+        grad_tile = dd * z_tile * mask_scale
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
-
-        if APPLY_MASK:
-            grad_sign = tl.where(grad_tile > 0, 1.0, tl.where(grad_tile < 0, -1.0, 0.0))
-            buf_sign = tl.where(buf_tile > 0, 1.0, tl.where(buf_tile < 0, -1.0, 0.0))
-            align_mask = (grad_sign == buf_sign).to(tl.float32)
-            grad_tile = grad_tile * align_mask
 
         buf_tile = momentum * buf_tile + (1.0 - momentum) * grad_tile
         tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
@@ -194,8 +195,12 @@ def _zo_muon_wide_kernel(
         tl.store(param_ptr + ptrs, param_tile - eta * orth_tile, mask=mask)
 
 
-def zo_muon_update(param, buf, z, scratch, dd, momentum, eta, apply_mask):
-    """Fused ZO-Muon update: grad + masking + momentum + Newton-Schulz + param update.
+def zo_muon_update(param, buf, z, scratch, dd, momentum, eta, mask_scale):
+    """Fused ZO-Muon update: grad + continuous masking + momentum + Newton-Schulz + param update.
+
+    mask_scale: float in [0, 1]. Scales the gradient before momentum accumulation.
+      1.0 = full gradient (no masking). 0.0 = zero gradient.
+      Computed in controller from cosine similarity between gradient and momentum.
 
     Dispatches to tall or wide kernel based on matrix shape.
     Tall (M >= N): standard N-S form, X.T@X is (N,N)
@@ -209,7 +214,7 @@ def zo_muon_update(param, buf, z, scratch, dd, momentum, eta, apply_mask):
             M, N=N,
             stride_m=param.stride(0), stride_n=param.stride(1),
             dd=dd, momentum=momentum, eta=eta,
-            APPLY_MASK=int(apply_mask),
+            mask_scale=mask_scale,
             BLOCK_M=128,
         )
     else:
@@ -218,7 +223,7 @@ def zo_muon_update(param, buf, z, scratch, dd, momentum, eta, apply_mask):
             M=M, N=N,
             stride_m=param.stride(0), stride_n=param.stride(1),
             dd=dd, momentum=momentum, eta=eta,
-            APPLY_MASK=int(apply_mask),
+            mask_scale=mask_scale,
             BLOCK_N=128,
         )
 

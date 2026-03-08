@@ -7,18 +7,14 @@ keeping the algorithm completely vLLM-free.
 from __future__ import annotations
 
 import json
-import os
-import pathlib
 import shutil
+from pathlib import Path
 from typing import Any
 
 import torch
 from safetensors.torch import save_file
 from vllm import SamplingParams
 from vllm.lora.request import LoRARequest
-
-
-ADAPTER_STAGING_DIR = "/dev/shm/ds_mezo"
 
 # vLLM merges these projections into fused modules at runtime.
 _VLLM_MERGES: dict[str, str] = {
@@ -44,18 +40,11 @@ def _register_activation_hooks(
     worker._ds_mezo_activations = {}
 
     for name, module in model.named_modules():
-        if "base_layer" in name:
-            continue
-        # Match by name suffix first (fast filter)
         suffix = name.rsplit(".", 1)[-1]
         if suffix not in hook_map:
             continue
         parts = name.split(".")
-        if "layers" not in parts:
-            continue
         layers_pos = parts.index("layers")
-        if layers_pos + 1 >= len(parts) or not parts[layers_pos + 1].isdigit():
-            continue
         layer_idx = int(parts[layers_pos + 1])
         keys = [(layer_idx, mod) for mod in hook_map[suffix]]
 
@@ -95,7 +84,7 @@ def _extract_prompt_logprobs(
 
 
 def _write_adapter_config(
-    adapter_dir: str, rank: int, target_modules: list[str],
+    adapter_dir: Path, rank: int, target_modules: list[str],
 ) -> None:
     """Write PEFT adapter config JSON."""
     config = {
@@ -106,14 +95,14 @@ def _write_adapter_config(
         "bias": "none",
         "task_type": "CAUSAL_LM",
     }
-    with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+    with open(adapter_dir / "adapter_config.json", "w") as f:
         json.dump(config, f)
 
 
 def _save_peft_adapter(
     A_list: list[torch.Tensor],
     B_list: list[torch.Tensor],
-    adapter_dir: str,
+    adapter_dir: Path,
     layers: list[Any],
 ) -> None:
     """Serialize A, B matrices as PEFT-compatible LoRA adapter (BF16).
@@ -127,7 +116,7 @@ def _save_peft_adapter(
         prefix = layers[layer_idx].peft_prefix
         tensors[f"{prefix}.lora_A.weight"] = B_l.bfloat16()
         tensors[f"{prefix}.lora_B.weight"] = A_l.bfloat16()
-    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
+    save_file(tensors, str(adapter_dir / "adapter_model.safetensors"))
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +124,10 @@ def _save_peft_adapter(
 # ---------------------------------------------------------------------------
 
 class VLLMBackend:
-    def __init__(self, engine: Any, layer_specs: list[Any], rank: int) -> None:
+    def __init__(
+        self, engine: Any, layer_specs: list[Any], rank: int,
+        staging_dir: Path | str = Path("/dev/shm/ds_mezo"),
+    ) -> None:
         self.engine = engine
 
         # Build hook_map from target modules + vLLM merge knowledge
@@ -147,22 +139,21 @@ class VLLMBackend:
             k: sorted(v) for k, v in hook_map.items()
         }
 
-        # Adapter staging on /dev/shm — always start fresh
-        staging = pathlib.Path(ADAPTER_STAGING_DIR)
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging / "adapter_pos")
-        os.makedirs(staging / "adapter_neg")
-        os.makedirs(staging / "checkpoints")
-        self.adapter_dir_pos = str(staging / "adapter_pos")
-        self.adapter_dir_neg = str(staging / "adapter_neg")
-        self.checkpoint_dir = str(staging / "checkpoints")
+        # Adapter staging — ephemeral directory for vLLM adapter hot-swap
+        staging = Path(staging_dir)
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.joinpath("adapter_pos").mkdir(parents=True)
+        staging.joinpath("adapter_neg").mkdir(parents=True)
+        self.adapter_dir_pos = staging / "adapter_pos"
+        self.adapter_dir_neg = staging / "adapter_neg"
 
-        unique_modules = list({ls.module_name for ls in layer_specs})
+        unique_modules = sorted({ls.module_name for ls in layer_specs})
         _write_adapter_config(self.adapter_dir_pos, rank, unique_modules)
         _write_adapter_config(self.adapter_dir_neg, rank, unique_modules)
 
-        self.lora_pos = LoRARequest("adapter_pos", 1, self.adapter_dir_pos, load_inplace=True)
-        self.lora_neg = LoRARequest("adapter_neg", 2, self.adapter_dir_neg, load_inplace=True)
+        self.lora_pos = LoRARequest("adapter_pos", 1, str(self.adapter_dir_pos), load_inplace=True)
+        self.lora_neg = LoRARequest("adapter_neg", 2, str(self.adapter_dir_neg), load_inplace=True)
 
         self.score_params = SamplingParams(
             max_tokens=1, prompt_logprobs=1, temperature=0.0
@@ -174,7 +165,7 @@ class VLLMBackend:
         neg_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         layers: list[Any],
     ) -> None:
-        """Serialize PiSSA adapters to /dev/shm for vLLM."""
+        """Serialize PiSSA adapters to staging directory for vLLM."""
         def get_AB(
             overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -198,8 +189,8 @@ class VLLMBackend:
     def generate(
         self, batch: list[str], temperature: float, n: int,
     ) -> list[Any]:
-        """Generate N candidates. Returns list of RequestOutput."""
-        gen_params = SamplingParams(n=n, temperature=temperature)
+        """Generate N candidates with per-token logprobs. Returns list of RequestOutput."""
+        gen_params = SamplingParams(n=n, temperature=temperature, logprobs=1)
         return self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
         )
