@@ -4,9 +4,13 @@ The controller calls backend methods that return plain Python types,
 keeping the algorithm completely vLLM-free.
 """
 
+from __future__ import annotations
+
 import json
 import os
+import pathlib
 import shutil
+from typing import Any
 
 import torch
 from safetensors.torch import save_file
@@ -17,7 +21,7 @@ from vllm.lora.request import LoRARequest
 ADAPTER_STAGING_DIR = "/dev/shm/ds_mezo"
 
 # vLLM merges these projections into fused modules at runtime.
-_VLLM_MERGES = {
+_VLLM_MERGES: dict[str, str] = {
     "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
     "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj",
 }
@@ -27,7 +31,9 @@ _VLLM_MERGES = {
 # Module-level functions (picklable for collective_rpc)
 # ---------------------------------------------------------------------------
 
-def _register_activation_hooks(worker, hook_map):
+def _register_activation_hooks(
+    worker: Any, hook_map: dict[str, list[str]],
+) -> int:
     """Register forward hooks on vLLM's worker model.
 
     hook_map: {vllm_suffix: [original_module_names]}
@@ -53,7 +59,10 @@ def _register_activation_hooks(worker, hook_map):
         layer_idx = int(parts[layers_pos + 1])
         keys = [(layer_idx, mod) for mod in hook_map[suffix]]
 
-        def hook_fn(mod, inp, out, ks=keys):
+        def hook_fn(
+            mod: Any, inp: tuple[torch.Tensor, ...], out: Any,
+            ks: list[tuple[int, str]] = keys,
+        ) -> None:
             act = inp[0].detach().float().cpu()
             for k in ks:
                 worker._ds_mezo_activations[k] = act
@@ -62,7 +71,9 @@ def _register_activation_hooks(worker, hook_map):
     return len(worker._ds_mezo_hooks)
 
 
-def _collect_and_remove_hooks(worker):
+def _collect_and_remove_hooks(
+    worker: Any,
+) -> dict[tuple[int, str], torch.Tensor]:
     """Collect activations and remove hooks."""
     activations = worker._ds_mezo_activations
     for h in worker._ds_mezo_hooks:
@@ -72,7 +83,9 @@ def _collect_and_remove_hooks(worker):
     return activations
 
 
-def _extract_prompt_logprobs(output, prompt_token_ids):
+def _extract_prompt_logprobs(
+    output: Any, prompt_token_ids: list[int],
+) -> list[float]:
     """Extract per-token logprobs from vLLM output."""
     logprobs = []
     for i, token_lp in enumerate(output.prompt_logprobs[1:], 1):
@@ -81,7 +94,9 @@ def _extract_prompt_logprobs(output, prompt_token_ids):
     return logprobs
 
 
-def _write_adapter_config(adapter_dir, rank, target_modules):
+def _write_adapter_config(
+    adapter_dir: str, rank: int, target_modules: list[str],
+) -> None:
     """Write PEFT adapter config JSON."""
     config = {
         "peft_type": "LORA",
@@ -95,7 +110,12 @@ def _write_adapter_config(adapter_dir, rank, target_modules):
         json.dump(config, f)
 
 
-def _save_peft_adapter(A_list, B_list, adapter_dir, layers):
+def _save_peft_adapter(
+    A_list: list[torch.Tensor],
+    B_list: list[torch.Tensor],
+    adapter_dir: str,
+    layers: list[Any],
+) -> None:
     """Serialize A, B matrices as PEFT-compatible LoRA adapter (BF16).
 
     PiSSA convention: W = W_res + A @ B where A:(d_out, r), B:(r, d_in)
@@ -104,7 +124,7 @@ def _save_peft_adapter(A_list, B_list, adapter_dir, layers):
     """
     tensors = {}
     for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
-        prefix = layers[layer_idx]["peft_prefix"]
+        prefix = layers[layer_idx].peft_prefix
         tensors[f"{prefix}.lora_A.weight"] = B_l.bfloat16()
         tensors[f"{prefix}.lora_B.weight"] = A_l.bfloat16()
     save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
@@ -115,24 +135,27 @@ def _save_peft_adapter(A_list, B_list, adapter_dir, layers):
 # ---------------------------------------------------------------------------
 
 class VLLMBackend:
-    def __init__(self, engine, layer_specs, rank):
+    def __init__(self, engine: Any, layer_specs: list[Any], rank: int) -> None:
         self.engine = engine
 
         # Build hook_map from target modules + vLLM merge knowledge
-        hook_map = {}
+        hook_map: dict[str, set[str]] = {}
         for ls in layer_specs:
             vllm_name = _VLLM_MERGES.get(ls.module_name, ls.module_name)
             hook_map.setdefault(vllm_name, set()).add(ls.module_name)
-        self.hook_map = {k: sorted(v) for k, v in hook_map.items()}
+        self.hook_map: dict[str, list[str]] = {
+            k: sorted(v) for k, v in hook_map.items()
+        }
 
-        # Adapter staging on /dev/shm
-        shutil.rmtree(ADAPTER_STAGING_DIR, ignore_errors=True)
-        self.adapter_dir_pos = os.path.join(ADAPTER_STAGING_DIR, "adapter_pos")
-        self.adapter_dir_neg = os.path.join(ADAPTER_STAGING_DIR, "adapter_neg")
-        self.checkpoint_dir = os.path.join(ADAPTER_STAGING_DIR, "checkpoints")
-        os.makedirs(self.adapter_dir_pos)
-        os.makedirs(self.adapter_dir_neg)
-        os.makedirs(self.checkpoint_dir)
+        # Adapter staging on /dev/shm — always start fresh
+        staging = pathlib.Path(ADAPTER_STAGING_DIR)
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging / "adapter_pos")
+        os.makedirs(staging / "adapter_neg")
+        os.makedirs(staging / "checkpoints")
+        self.adapter_dir_pos = str(staging / "adapter_pos")
+        self.adapter_dir_neg = str(staging / "adapter_neg")
+        self.checkpoint_dir = str(staging / "checkpoints")
 
         unique_modules = list({ls.module_name for ls in layer_specs})
         _write_adapter_config(self.adapter_dir_pos, rank, unique_modules)
@@ -145,16 +168,23 @@ class VLLMBackend:
             max_tokens=1, prompt_logprobs=1, temperature=0.0
         )
 
-    def sync_adapters(self, pos_overrides, neg_overrides, layers):
+    def sync_adapters(
+        self,
+        pos_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
+        neg_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
+        layers: list[Any],
+    ) -> None:
         """Serialize PiSSA adapters to /dev/shm for vLLM."""
-        def get_AB(overrides):
+        def get_AB(
+            overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
+        ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
             A_list, B_list = [], []
             for layer in layers:
-                k = (layer["layer_idx"], layer["module_name"])
+                k = layer.key
                 if k in overrides:
                     A_l, B_l = overrides[k]
                 else:
-                    A_l, B_l = layer["A"], layer["B"]
+                    A_l, B_l = layer.A, layer.B
                 A_list.append(A_l)
                 B_list.append(B_l)
             return A_list, B_list
@@ -165,15 +195,18 @@ class VLLMBackend:
         A_neg, B_neg = get_AB(neg_overrides)
         _save_peft_adapter(A_neg, B_neg, self.adapter_dir_neg, layers)
 
-    def generate(self, batch, temperature, n):
-        """Generate N candidates. Returns (prompt_token_ids, scored_outputs)."""
+    def generate(
+        self, batch: list[str], temperature: float, n: int,
+    ) -> list[Any]:
+        """Generate N candidates. Returns list of RequestOutput."""
         gen_params = SamplingParams(n=n, temperature=temperature)
-        request_outputs = self.engine.generate(
+        return self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
         )
-        return request_outputs
 
-    def score(self, token_sequences, lora_request):
+    def score(
+        self, token_sequences: list[list[int]], lora_request: LoRARequest,
+    ) -> list[list[float]]:
         """Prefill-only logprob extraction. Returns list[list[float]]."""
         prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
         outputs = self.engine.generate(
@@ -184,7 +217,9 @@ class VLLMBackend:
             for out, seq in zip(outputs, token_sequences)
         ]
 
-    def extract_activations(self, input_data):
+    def extract_activations(
+        self, input_data: list[str],
+    ) -> dict[tuple[int, str], torch.Tensor]:
         """Hook-based activation capture. Returns {(layer_idx, module_name): Tensor}."""
         self.engine.llm_engine.collective_rpc(
             _register_activation_hooks, args=(self.hook_map,)

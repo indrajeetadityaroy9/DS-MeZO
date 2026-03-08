@@ -6,6 +6,8 @@ Experiments 1-7: Controlled A/B ablations, each disabling one component.
 Usage: python eval/ablations.py
 """
 
+from __future__ import annotations
+
 import os
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 os.environ["USE_TF"] = "0"
@@ -14,17 +16,22 @@ os.environ["OMP_NUM_THREADS"] = "16"
 os.environ["MKL_NUM_THREADS"] = "16"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import subprocess
 import sys
 import time
+import types
+from typing import Any, Callable
+
 import torch
 
-sys.path.insert(0, "/home/ubuntu/DS-MeZO")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from vllm import LLM, SamplingParams
-from ds_mezo.model_config import discover_layers
+from ds_mezo.model_config import LayerSpec, discover_layers
 from ds_mezo.backend import VLLMBackend
-from ds_mezo.controller import DSMeZO_Controller
+from ds_mezo.controller import DSMeZO_Controller, LayerState
 from ds_mezo.kernels import fused_perturb_dual
+from eval.utils import extract_code
 
 TOTAL_STEPS = 200
 
@@ -54,35 +61,27 @@ PROMPTS = [
 EVAL_PROMPTS = PROMPTS[:5]
 
 
-def score_fn(text):
+def score_fn(text: str) -> float:
+    """Score = length of syntactically valid Python code.
+    Returns 0 for non-compilable output, len(code) otherwise."""
+    code = extract_code(text)
     try:
-        compile(text, "<eval>", "exec")
-        return len(text)
+        compile(code, "<eval>", "exec")
+        return float(len(code))
     except SyntaxError:
-        if "```python" in text:
-            code = text.split("```python")[1].split("```")[0]
-            try:
-                compile(code, "<eval>", "exec")
-                return len(code)
-            except SyntaxError:
-                pass
-        if "```" in text:
-            code = text.split("```")[1].split("```")[0]
-            try:
-                compile(code, "<eval>", "exec")
-                return len(code)
-            except SyntaxError:
-                pass
-        if "def " in text or "class " in text:
-            return len(text) // 2
-        return 0
+        return 0.0
 
 
-def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
+def run_experiment(
+    llm: Any,
+    layer_specs: list[LayerSpec],
+    name: str,
+    config_overrides: dict[str, Any],
+    patch_fn: Callable[[DSMeZO_Controller], None] | None,
+) -> dict[str, Any]:
     """Run a single experiment: init controller, train, eval, return results."""
     torch.manual_seed(42)
     config = {
-        "model_path": "/dev/shm/pissa_prep/residual",
         "adapter_path": "/dev/shm/pissa_prep/adapter",
         "total_steps": TOTAL_STEPS,
         "score_fn": score_fn,
@@ -93,7 +92,6 @@ def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
     controller = DSMeZO_Controller(backend, layer_specs, config)
 
     # Memory measurement via nvidia-smi (vLLM loads model in subprocess)
-    import subprocess
     nvsmi = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
         capture_output=True, text=True,
@@ -110,7 +108,7 @@ def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
         batch = [PROMPTS[step_idx % len(PROMPTS)]]
         controller.step(batch)
         if (step_idx + 1) % 50 == 0:
-            loss_str = f"{controller.loss_ema:.2e}" if controller.loss_ema else "N/A"
+            loss_str = f"{controller.loss_ema:.2e}"
             print(f"    [{name}] step {step_idx+1}/{TOTAL_STEPS} "
                   f"loss_ema={loss_str} lr={controller.eta:.2e}")
     train_time = time.time() - t0
@@ -125,7 +123,7 @@ def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
         lora_request=backend.lora_pos,
     )
     scores = [score_fn(out.outputs[0].text) for out in outputs]
-    avg_score = sum(scores) / len(scores)
+    avg_score = sum(scores) / max(len(scores), 1)
 
     result = {
         "name": name,
@@ -146,38 +144,36 @@ def run_experiment(llm, layer_specs, name, config_overrides, patch_fn):
 
 # ── Monkey-patch functions ──────────────────────────────────────────────────
 
-def patch_sgd_momentum(controller):
+def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
     """Replace ZO-Muon (N-S orthogonalization) with plain SGD+momentum."""
-    original_step = controller.step.__func__
 
-    def patched_step(self, batch):
+    def patched_step(self: DSMeZO_Controller, batch: list[str]) -> None:
         self.step_count += 1
 
-        trajectories, advantages = self._explore(batch)
+        trajectories, advantages, prompt_len = self._explore(batch)
 
         batch_activations = self.backend.extract_activations(batch)
         needs_recalib = self._update_activation_bases_power_iter(batch_activations)
         if needs_recalib:
             self._calibrate_activation_bases_full(batch)
 
-        perturbations = {}
+        perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
-            key = (layer["layer_idx"], layer["module_name"])
-            perturbations[key] = self._get_perturbation(layer)
+            perturbations[layer.key] = self._get_perturbation(layer)
 
-        pos_layers, neg_layers = {}, {}
+        pos_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
-            key = (layer["layer_idx"], layer["module_name"])
-            z_A, z_B = perturbations[key]
-            pos_A, neg_A = torch.empty_like(layer["A"]), torch.empty_like(layer["A"])
-            pos_B, neg_B = torch.empty_like(layer["B"]), torch.empty_like(layer["B"])
-            fused_perturb_dual(layer["A"], z_A, pos_A, neg_A)
-            fused_perturb_dual(layer["B"], z_B, pos_B, neg_B)
-            pos_layers[key] = (pos_A, pos_B)
-            neg_layers[key] = (neg_A, neg_B)
+            z_A, z_B = perturbations[layer.key]
+            pos_A, neg_A = torch.empty_like(layer.A), torch.empty_like(layer.A)
+            pos_B, neg_B = torch.empty_like(layer.B), torch.empty_like(layer.B)
+            fused_perturb_dual(layer.A, z_A, pos_A, neg_A)
+            fused_perturb_dual(layer.B, z_B, pos_B, neg_B)
+            pos_layers[layer.key] = (pos_A, pos_B)
+            neg_layers[layer.key] = (neg_A, neg_B)
 
         self._sync_adapters(pos_layers, neg_layers)
-        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages)
+        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
 
         if self._check_health(loss_pos, loss_neg):
             raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
@@ -188,10 +184,9 @@ def patch_sgd_momentum(controller):
             self.eta = effective_eta
 
             for layer in self.layers:
-                key = (layer["layer_idx"], layer["module_name"])
-                z_A, z_B = perturbations[key]
-                key_A = (key, "A")
-                key_B = (key, "B")
+                z_A, z_B = perturbations[layer.key]
+                key_A = (layer.key, "A")
+                key_B = (layer.key, "B")
 
                 # SGD+momentum: no Newton-Schulz orthogonalization
                 grad_A = dd * z_A
@@ -200,11 +195,11 @@ def patch_sgd_momentum(controller):
                     mask = (torch.sign(grad_A) == torch.sign(self.momentum_buffers[key_A])).float()
                     grad_A = grad_A * mask
                 self.momentum_buffers[key_A].mul_(self.momentum).add_((1 - self.momentum) * grad_A)
-                layer["A"].sub_(self.eta * self.momentum_buffers[key_A])
+                layer.A.sub_(self.eta * self.momentum_buffers[key_A])
 
                 grad_B = dd * z_B
                 self.momentum_buffers[key_B].mul_(self.momentum).add_((1 - self.momentum) * grad_B)
-                layer["B"].sub_(self.eta * self.momentum_buffers[key_B])
+                layer.B.sub_(self.eta * self.momentum_buffers[key_B])
 
             self.eta = saved_eta
 
@@ -213,22 +208,23 @@ def patch_sgd_momentum(controller):
         self._update_temperature()
 
         reward_range = self._last_reward_range
-        if self.initial_entropy is None and reward_range > 0:
+        if self.initial_entropy == 0 and reward_range > 0:
             self.initial_entropy = reward_range
-        if (self.initial_entropy and reward_range > 0
+        if (self.initial_entropy > 0 and reward_range > 0
                 and reward_range < 0.5 * self.initial_entropy):
             self.explore_temperature = min(
                 self.explore_temperature * 1.5, self.T_max
             )
 
-    import types
     controller.step = types.MethodType(patched_step, controller)
 
 
-def patch_random_perturbation(controller):
+def patch_random_perturbation(controller: DSMeZO_Controller) -> None:
     """Replace AGZO subspace perturbation with random orthonormal basis."""
-    def patched_get_perturbation(self, layer):
-        A, B = layer["A"], layer["B"]
+    def patched_get_perturbation(
+        self: DSMeZO_Controller, layer: LayerState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        A, B = layer.A, layer.B
         r_calib = self.r_calib
 
         d_in = B.shape[1]
@@ -244,27 +240,24 @@ def patch_random_perturbation(controller):
 
         return z_A * self.eps, z_B * self.eps
 
-    import types
     controller._get_perturbation = types.MethodType(patched_get_perturbation, controller)
 
 
-def patch_static_bases(controller):
+def patch_static_bases(controller: DSMeZO_Controller) -> None:
     """Freeze activation bases at initial SVD — no per-step power iteration."""
-    import types
     controller._update_activation_bases_power_iter = types.MethodType(
         lambda self, activations: False, controller
     )
 
 
-def patch_fixed_eps(controller):
+def patch_fixed_eps(controller: DSMeZO_Controller) -> None:
     """Disable adaptive epsilon — keep at initial value."""
-    import types
     controller._update_eps = types.MethodType(lambda self: None, controller)
 
 
 # ── Experiment definitions ──────────────────────────────────────────────────
 
-EXPERIMENTS = [
+EXPERIMENTS: list[dict[str, Any]] = [
     {"name": "control",       "overrides": {},                                     "patch": None},
     {"name": "no_zomuon",     "overrides": {},                                     "patch": patch_sgd_momentum},
     {"name": "no_agzo",       "overrides": {},                                     "patch": patch_random_perturbation},
@@ -276,7 +269,7 @@ EXPERIMENTS = [
 ]
 
 
-def main():
+def main() -> None:
     print("=" * 70)
     print("DS-MeZO ABLATION EVALUATION")
     print(f"Steps per experiment: {TOTAL_STEPS} | Experiments: {len(EXPERIMENTS)}")
@@ -299,7 +292,6 @@ def main():
     layer_specs = discover_layers("/dev/shm/pissa_prep/residual", ["q_proj", "v_proj"])
 
     # Experiment 0: inference-only memory baseline
-    import subprocess
     nvsmi = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
         capture_output=True, text=True,
@@ -311,7 +303,7 @@ def main():
     torch.cuda.reset_peak_memory_stats()
 
     # Run all experiments
-    results = []
+    results: list[dict[str, Any]] = []
     for i, exp in enumerate(EXPERIMENTS):
         print(f"\n--- Experiment {i+1}/{len(EXPERIMENTS)}: {exp['name']} ---")
         result = run_experiment(llm, layer_specs, exp["name"], exp["overrides"], exp["patch"])
@@ -339,8 +331,8 @@ def main():
     print(f"{'Experiment':<16} | {'Score':>7} | {'Loss EMA':>10} | {'dd EMA':>10} | {'Time':>6}")
     print("-" * 70)
     for r in results:
-        loss_str = f"{r['loss_ema']:.2e}" if r["loss_ema"] else "N/A"
-        dd_str = f"{r['dd_ema']:.4f}" if r["dd_ema"] else "N/A"
+        loss_str = f"{r['loss_ema']:.2e}"
+        dd_str = f"{r['dd_ema']:.4f}"
         print(f"{r['name']:<16} | {r['avg_score']:7.1f} | {loss_str:>10} | {dd_str:>10} | {r['train_time']:5.1f}s")
 
     # Delta from control

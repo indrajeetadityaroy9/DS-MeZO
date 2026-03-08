@@ -1,6 +1,6 @@
 """PiSSA decomposition: pretrained model → W_res base model + A,B PEFT adapter.
 
-Usage: python scripts/prepare_pissa.py <model_path> <output_dir> [target_modules...]
+Usage: python scripts/prepare_pissa.py --model <model_path> --output <output_dir> [--targets q_proj v_proj]
 
 Processes one layer at a time to minimize memory.
 Output:
@@ -8,37 +8,33 @@ Output:
   {output_dir}/adapter/   — PEFT LoRA adapter (initial A, B matrices)
 """
 
-import sys
-import os
+from __future__ import annotations
+
+import argparse
 import json
+import os
 import shutil
-import torch
+import sys
 from pathlib import Path
+
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from ds_mezo.model_config import discover_layers
 
 RANK = 16
 
 
-def find_safetensor_files(model_path):
+def find_safetensor_files(model_path: str) -> list[Path]:
     """Return sorted list of safetensor shard files."""
     return sorted(Path(model_path).glob("*.safetensors"))
 
 
-def build_key_to_file_map(model_path):
-    """Map each tensor key to its safetensor shard file."""
-    key_map = {}
-    for f in find_safetensor_files(model_path):
-        with safe_open(str(f), framework="pt") as sf:
-            for key in sf.keys():
-                key_map[key] = str(f)
-    return key_map
-
-
-def decompose(W0, rank):
+def decompose(
+    W0: torch.Tensor, rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """PiSSA decomposition: W0 = A @ B + W_res (§3.1).
     torch.svd_lowrank returns (U, S, V) where V is n×q, not transposed."""
     U, S, V = torch.svd_lowrank(W0, q=rank, niter=2)
@@ -49,10 +45,17 @@ def decompose(W0, rank):
     return A, B, W_res
 
 
-def main():
-    model_path = sys.argv[1]
-    output_dir = sys.argv[2]
-    target_modules = sys.argv[3:] or ["q_proj", "v_proj"]
+def main() -> None:
+    parser = argparse.ArgumentParser(description="PiSSA decomposition")
+    parser.add_argument("--model", required=True, help="Path to pretrained model")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--targets", nargs="+", default=["q_proj", "v_proj"],
+                        help="Target module names")
+    args = parser.parse_args()
+
+    model_path = args.model
+    output_dir = args.output
+    target_modules = args.targets
     residual_dir = os.path.join(output_dir, "residual")
     adapter_dir = os.path.join(output_dir, "adapter")
 
@@ -78,9 +81,9 @@ def main():
                 shutil.copy2(str(f), dest)
 
     # Process shard by shard
-    adapter_tensors = {}
+    adapter_tensors: dict[str, torch.Tensor] = {}
     for shard_file in find_safetensor_files(model_path):
-        shard_tensors = {}
+        shard_tensors: dict[str, torch.Tensor] = {}
         with safe_open(str(shard_file), framework="pt") as sf:
             for key in sf.keys():
                 tensor = sf.get_tensor(key)

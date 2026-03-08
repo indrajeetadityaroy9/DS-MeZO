@@ -5,7 +5,10 @@ trainable linear layers without loading weights (zero memory). Works for any
 HuggingFace causal LM architecture.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -18,7 +21,9 @@ class LayerSpec:
     peft_prefix: str    # "base_model.model.model.layers.5.self_attn.q_proj"
 
 
-def discover_layers(model_path, target_modules):
+def discover_layers(
+    model_path: str, target_modules: list[str],
+) -> list[LayerSpec]:
     """Discover trainable layers via PyTorch model introspection.
 
     Instantiates an empty model on meta device (zero memory), iterates
@@ -29,7 +34,7 @@ def discover_layers(model_path, target_modules):
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
 
-    specs = []
+    specs: list[LayerSpec] = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
             continue

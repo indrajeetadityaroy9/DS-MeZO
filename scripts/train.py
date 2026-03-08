@@ -1,16 +1,19 @@
 """DS-MeZO training entry point.
 
-Usage: bash scripts/launch.sh <config.yaml> <prompts.jsonl>
+Usage: bash scripts/launch.sh --config <config.yaml> --prompts <prompts.jsonl>
 
 Config YAML only requires model_path and adapter_path.
-All other hyperparameters use spec defaults from controller.DEFAULTS.
+All other hyperparameters use spec defaults from DSMeZOConfig.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
+
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-import sys
-import json
 import yaml
 from vllm import LLM
 from ds_mezo.model_config import discover_layers
@@ -18,10 +21,15 @@ from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
 
 
-def main():
-    with open(sys.argv[1]) as f:
+def main() -> None:
+    parser = argparse.ArgumentParser(description="DS-MeZO training")
+    parser.add_argument("--config", required=True, help="Path to config YAML")
+    parser.add_argument("--prompts", required=True, help="Path to prompts JSONL")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
         config = yaml.safe_load(f)
-    with open(sys.argv[2]) as f:
+    with open(args.prompts) as f:
         prompts = [json.loads(line)["prompt"] for line in f]
 
     llm = LLM(

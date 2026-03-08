@@ -8,8 +8,9 @@ Usage: python tests/test_evaluation.py
 """
 
 import sys
+import os
 import math
-sys.path.insert(0, "/home/ubuntu/DS-MeZO")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 from ds_mezo.kernels import zo_muon_update, fused_perturb_dual
@@ -515,11 +516,13 @@ def test_dd_clipping():
     print("\n=== §2.1: Directional derivative clipping ===")
 
     # Replicate controller._clip_dd logic
-    dd_ema = None
+    dd_ema = 0.0
+    call_count = 0
 
     def clip_dd(dd):
-        nonlocal dd_ema
-        if dd_ema is None:
+        nonlocal dd_ema, call_count
+        call_count += 1
+        if call_count == 1:
             dd_ema = abs(dd)
             return dd
         clip_val = 3 * dd_ema
@@ -563,13 +566,15 @@ def test_health_spike_detection():
     """Claim (§4.4): Skip step if NLL > 5× EMA."""
     print("\n=== §4.4: Health monitoring spike detection ===")
 
-    loss_ema = None
-    initial_loss_ema = None
+    loss_ema = 0.0
+    initial_loss_ema = 0.0
+    health_call_count = 0
 
     def check_health(loss_pos, loss_neg):
-        nonlocal loss_ema, initial_loss_ema
+        nonlocal loss_ema, initial_loss_ema, health_call_count
+        health_call_count += 1
         avg_nll = (abs(loss_pos) + abs(loss_neg)) / 2
-        if loss_ema is None:
+        if health_call_count == 1:
             loss_ema = avg_nll
             initial_loss_ema = avg_nll
             return True
@@ -1114,12 +1119,8 @@ if __name__ == "__main__":
 
     results = []
     for test in tests:
-        try:
-            ok = test()
-            results.append((test.__name__, ok))
-        except Exception as e:
-            print(f"  EXCEPTION: {e}")
-            results.append((test.__name__, False))
+        ok = test()
+        results.append((test.__name__, ok))
 
     print(f"\n{'='*60}")
     passed = sum(1 for _, ok in results if ok)

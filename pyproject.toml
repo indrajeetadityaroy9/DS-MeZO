@@ -11,6 +11,9 @@ dependencies = [
     "triton==3.6.0",
     "vllm==0.17.0",
     "safetensors==0.7.0",
+    "transformers==4.51.0",
+    "datasets==3.5.0",
+    "evaluate==0.4.3",
     "PyYAML==6.0.1",
 ]
 

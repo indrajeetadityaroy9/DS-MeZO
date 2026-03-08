@@ -4,8 +4,12 @@ Uses evaluate (HuggingFace) for metrics and datasets for data loading.
 All benchmarks use vLLM for generation via the engine passed at call time.
 """
 
+from __future__ import annotations
+
 import math
 import re
+from typing import Any
+
 import evaluate
 from datasets import load_dataset
 from vllm import SamplingParams
@@ -15,7 +19,12 @@ from vllm import SamplingParams
 # Perplexity — direct NLL measurement on held-out data
 # ---------------------------------------------------------------------------
 
-def eval_perplexity(engine, token_sequences, prompt_lens, lora_request=None):
+def eval_perplexity(
+    engine: Any,
+    token_sequences: list[list[int]],
+    prompt_lens: list[int],
+    lora_request: Any = None,
+) -> dict[str, float | int]:
     """Per-token perplexity on held-out sequences.
 
     Measures NLL via prefill logprobs, reports perplexity = exp(avg NLL).
@@ -28,9 +37,8 @@ def eval_perplexity(engine, token_sequences, prompt_lens, lora_request=None):
     )
 
     total_nll, total_tokens = 0.0, 0
-    per_sample = []
+    num_samples = 0
     for out, seq, plen in zip(outputs, token_sequences, prompt_lens):
-        # Extract logprobs for completion tokens only
         sample_nll = 0.0
         n_completion = 0
         for i, token_lp in enumerate(out.prompt_logprobs[1:], 1):
@@ -41,17 +49,16 @@ def eval_perplexity(engine, token_sequences, prompt_lens, lora_request=None):
             sample_nll += -lp
             n_completion += 1
         if n_completion > 0:
-            avg = sample_nll / n_completion
-            per_sample.append({"nll": avg, "ppl": math.exp(avg), "tokens": n_completion})
             total_nll += sample_nll
             total_tokens += n_completion
+            num_samples += 1
 
-    avg_nll = total_nll / total_tokens if total_tokens > 0 else 0.0
+    avg_nll = total_nll / max(total_tokens, 1)
     return {
         "perplexity": math.exp(avg_nll),
         "avg_nll": avg_nll,
         "total_tokens": total_tokens,
-        "num_samples": len(per_sample),
+        "num_samples": num_samples,
     }
 
 
@@ -59,7 +66,11 @@ def eval_perplexity(engine, token_sequences, prompt_lens, lora_request=None):
 # GSM8K — math reasoning, exact match on final numerical answer
 # ---------------------------------------------------------------------------
 
-def eval_gsm8k(engine, lora_request=None, num_samples=None):
+def eval_gsm8k(
+    engine: Any,
+    lora_request: Any = None,
+    num_samples: int | None = None,
+) -> dict[str, Any]:
     """GSM8K exact-match accuracy.
 
     Generates chain-of-thought solutions, extracts final answer via #### pattern,
@@ -100,8 +111,13 @@ def eval_gsm8k(engine, lora_request=None, num_samples=None):
 # MMLU — knowledge, multiple-choice via logprob comparison
 # ---------------------------------------------------------------------------
 
-def eval_mmlu(engine, tokenizer, lora_request=None, num_samples=None):
-    """MMLU accuracy via logprob comparison for A/B/C/D choices.
+def eval_mmlu(
+    engine: Any,
+    tokenizer: Any,
+    lora_request: Any = None,
+    num_samples: int | None = None,
+) -> dict[str, Any]:
+    """MMLU accuracy via batched logprob comparison for A/B/C/D choices.
 
     Uses evaluate.accuracy for the metric. Scores each choice by computing
     the logprob of the answer token after the prompt.
@@ -114,8 +130,8 @@ def eval_mmlu(engine, tokenizer, lora_request=None, num_samples=None):
     score_params = SamplingParams(max_tokens=1, prompt_logprobs=1, temperature=0.0)
     choices = ["A", "B", "C", "D"]
 
-    predictions, references = [], []
-
+    # Build all sequences for all samples in one batch
+    all_seqs: list[list[int]] = []
     for row in dataset:
         prompt = f"Question: {row['question']}\n"
         for i, c in enumerate(choices):
@@ -124,20 +140,26 @@ def eval_mmlu(engine, tokenizer, lora_request=None, num_samples=None):
 
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
 
-        # Score each choice token
-        best_choice, best_lp = 0, float("-inf")
-        seqs = []
         for c in choices:
             choice_ids = tokenizer.encode(f" {c}", add_special_tokens=False)
-            seqs.append(prompt_ids + choice_ids)
+            all_seqs.append(prompt_ids + choice_ids)
 
-        seq_prompts = [{"prompt_token_ids": seq} for seq in seqs]
-        outputs = engine.generate(
-            seq_prompts, sampling_params=score_params, lora_request=lora_request
-        )
+    # Single batched engine call
+    seq_prompts = [{"prompt_token_ids": seq} for seq in all_seqs]
+    outputs = engine.generate(
+        seq_prompts, sampling_params=score_params, lora_request=lora_request,
+    )
 
-        for i, (out, seq) in enumerate(zip(outputs, seqs)):
-            # Logprob of the last (choice) token
+    # Collect logprobs per sample
+    predictions: list[int] = []
+    references: list[int] = []
+    num_choices = len(choices)
+    for sample_idx, row in enumerate(dataset):
+        best_choice, best_lp = 0, float("-inf")
+        base = sample_idx * num_choices
+        for i in range(num_choices):
+            out = outputs[base + i]
+            seq = all_seqs[base + i]
             last_lp = out.prompt_logprobs[-1]
             tok_id = seq[-1]
             lp = last_lp[tok_id].logprob
@@ -156,10 +178,10 @@ def eval_mmlu(engine, tokenizer, lora_request=None, num_samples=None):
 # Shared code completion trimming
 # ---------------------------------------------------------------------------
 
-def _trim_code_completion(text):
+def _trim_code_completion(text: str) -> str:
     """Stop at end of code block or first non-indented non-definition line."""
     lines = text.split("\n")
-    trimmed = []
+    trimmed: list[str] = []
     for line in lines:
         if line.strip() == "```":
             break
@@ -174,7 +196,9 @@ def _trim_code_completion(text):
 # HumanEval — code generation, pass@1 via execution
 # ---------------------------------------------------------------------------
 
-def eval_humaneval(engine, lora_request=None):
+def eval_humaneval(
+    engine: Any, lora_request: Any = None,
+) -> dict[str, Any]:
     """HumanEval pass@1 via evaluate.code_eval.
 
     Generates function completions, executes with test cases in sandbox.
@@ -189,8 +213,8 @@ def eval_humaneval(engine, lora_request=None):
         lora_request=lora_request,
     )
 
-    test_cases = []
-    predictions = []
+    test_cases: list[str] = []
+    predictions: list[list[str]] = []
     for out, row in zip(outputs, dataset):
         predictions.append([_trim_code_completion(out.outputs[0].text)])
         test_cases.append(row["test"] + f"\ncheck({row['entry_point']})")
@@ -207,7 +231,9 @@ def eval_humaneval(engine, lora_request=None):
 # MBPP — code generation, pass@1 via execution
 # ---------------------------------------------------------------------------
 
-def eval_mbpp(engine, lora_request=None):
+def eval_mbpp(
+    engine: Any, lora_request: Any = None,
+) -> dict[str, Any]:
     """MBPP pass@1 via evaluate.code_eval.
 
     Generates Python functions from natural language descriptions,
@@ -216,7 +242,7 @@ def eval_mbpp(engine, lora_request=None):
     dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
     code_eval = evaluate.load("code_eval")
 
-    prompts = []
+    prompts: list[str] = []
     for row in dataset:
         func_match = re.search(r'(?:assert\s+(?:not\s+)?(?:\()?\s*)(\w+)\s*\(', row['test_list'][0])
         func_name = func_match.group(1) if func_match else "solution"
@@ -228,7 +254,8 @@ def eval_mbpp(engine, lora_request=None):
         lora_request=lora_request,
     )
 
-    predictions, references = [], []
+    predictions: list[list[str]] = []
+    references: list[str] = []
     for out, row in zip(outputs, dataset):
         predictions.append([_trim_code_completion(out.outputs[0].text)])
         imports = "\n".join(row["test_imports"])
