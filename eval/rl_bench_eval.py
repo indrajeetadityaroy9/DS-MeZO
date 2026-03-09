@@ -100,7 +100,7 @@ def main() -> None:
 
         log.append({
             "step": step_idx + 1,
-            "loss_ema": controller.loss_ema,
+            "dd_ema": controller.dd_ema,
             "eta": controller.eta,
             "eps": controller.eps,
         })
@@ -109,7 +109,7 @@ def main() -> None:
             elapsed = time.time() - t_start
             s_per_step = elapsed / (step_idx + 1)
             print(f"  step {step_idx+1:4d}/{total_steps} | "
-                  f"loss_ema={controller.loss_ema:.4f} | "
+                  f"dd_ema={controller.dd_ema:.4f} | "
                   f"lr={controller.eta:.2e} | "
                   f"{s_per_step:.1f}s/step")
 
@@ -137,8 +137,7 @@ def main() -> None:
         print(f"  MBPP pass@10 pre:   {pre_mbpp['pass@10']:.1%}")
         print(f"  MBPP pass@10 post:  {post_mbpp['pass@10']:.1%}")
         print(f"  Delta pass@10:      {delta_10:+.1%}")
-    print(f"  Initial loss EMA:   {controller.initial_loss_ema:.4f}")
-    print(f"  Final loss EMA:     {controller.loss_ema:.4f}")
+    print(f"  Final DD EMA:       {controller.dd_ema:.4f}")
     print(f"  Training time:      {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
 
     # Save

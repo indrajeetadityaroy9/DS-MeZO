@@ -1,7 +1,7 @@
-"""DS-MeZO ablation evaluation: 8 experiments proving spec claims.
+"""DS-MeZO ablation evaluation: 4 experiments proving spec claims.
 
 Experiment 0: Memory measurement (§1 near-inference cost)
-Experiments 1-7: Controlled A/B ablations, each disabling one component.
+Experiments 1-3: Controlled A/B ablations, each disabling one component.
 
 Training uses MBPP train split with execution-based reward.
 Evaluation uses MBPP test split pass@1 (greedy, execution-based).
@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-import torch.nn.functional as F
 
 from vllm import LLM
 from ds_mezo.model_config import LayerSpec, discover_layers
@@ -78,7 +77,7 @@ def run_experiment(
         controller.step([problem["prompt"]])
         if (step_idx + 1) % 50 == 0:
             print(f"    [{name}] step {step_idx+1}/{TOTAL_STEPS} "
-                  f"loss_ema={controller.loss_ema:.2e} lr={controller.eta:.2e}")
+                  f"dd_ema={controller.dd_ema:.2e} lr={controller.eta:.2e}")
     train_time = time.time() - t0
 
     mem_peak = torch.cuda.max_memory_allocated() / 1e9
@@ -90,7 +89,6 @@ def run_experiment(
     result = {
         "name": name,
         "pass@1": mbpp_result["pass@1"],
-        "loss_ema": controller.loss_ema,
         "dd_ema": controller.dd_ema,
         "train_time": train_time,
         "mem_after_init": mem_after_init,
@@ -112,12 +110,10 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
     def patched_step(self: DSMeZO_Controller, batch: list[str]) -> None:
         self.step_count += 1
 
-        trajectories, advantages, prompt_len, reward_var = self._explore(batch)
+        trajectories, advantages, prompt_len = self._explore(batch)
 
         batch_activations = self.backend.extract_activations(batch)
-        needs_recalib = self._update_activation_bases_power_iter(batch_activations)
-        if needs_recalib:
-            self._calibrate_activation_bases_full(batch)
+        self._update_activation_bases(batch_activations)
 
         perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
@@ -137,50 +133,25 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
         loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
 
-        if self._check_health(loss_pos, loss_neg):
-            raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
-            dd = self._clip_dd(raw_dd)
+        raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
+        dd = self._zclip(raw_dd)
 
-            effective_eta = self._apply_kl_constraint(loss_pos, loss_neg)
+        for layer in self.layers:
+            z_A, z_B = perturbations[layer.key]
+            key_A = (layer.key, "A")
+            key_B = (layer.key, "B")
 
-            for layer in self.layers:
-                z_A, z_B = perturbations[layer.key]
-                key_A = (layer.key, "A")
-                key_B = (layer.key, "B")
+            # SGD+momentum (no Newton-Schulz)
+            grad_A = dd * z_A
+            self.momentum_buffers[key_A].mul_(self.momentum).add_((1 - self.momentum) * grad_A)
+            layer.A.sub_(self.eta * self.momentum_buffers[key_A])
 
-                # SGD+momentum with continuous masking (no Newton-Schulz)
-                grad_A = dd * z_A
-                if self.step_count > self.mask_warmup:
-                    cossim = F.cosine_similarity(
-                        grad_A.reshape(1, -1),
-                        self.momentum_buffers[key_A].reshape(1, -1),
-                    ).item()
-                    s = (cossim + 1.0) / 2.0
-                    self.mask_scale_ema[key_A] = (
-                        self.momentum * self.mask_scale_ema[key_A]
-                        + (1.0 - self.momentum) * s
-                    )
-                    grad_A = grad_A * self.mask_scale_ema[key_A]
-                self.momentum_buffers[key_A].mul_(self.momentum).add_((1 - self.momentum) * grad_A)
-                layer.A.sub_(effective_eta * self.momentum_buffers[key_A])
-
-                grad_B = dd * z_B
-                self.momentum_buffers[key_B].mul_(self.momentum).add_((1 - self.momentum) * grad_B)
-                layer.B.sub_(effective_eta * self.momentum_buffers[key_B])
+            grad_B = dd * z_B
+            self.momentum_buffers[key_B].mul_(self.momentum).add_((1 - self.momentum) * grad_B)
+            layer.B.sub_(self.eta * self.momentum_buffers[key_B])
 
         self._update_lr()
-        self._update_eps()
         self._update_temperature()
-
-        # Reward-variance exploration monitoring
-        alpha = self._ema_alpha()
-        if self.initial_reward_var == 0.0 and reward_var > 0:
-            self.reward_var_ema = reward_var
-            self.initial_reward_var = reward_var
-        elif self.initial_reward_var > 0:
-            self.reward_var_ema += alpha * (reward_var - self.reward_var_ema)
-            if self.reward_var_ema < self.initial_reward_var * 0.25:
-                self.explore_temperature = self.T_max
 
     controller.step = types.MethodType(patched_step, controller)
 
@@ -211,29 +182,9 @@ def patch_random_perturbation(controller: DSMeZO_Controller) -> None:
 
 def patch_static_bases(controller: DSMeZO_Controller) -> None:
     """Freeze activation bases at initial SVD — no per-step power iteration."""
-    controller._update_activation_bases_power_iter = types.MethodType(
-        lambda self, activations: False, controller
+    controller._update_activation_bases = types.MethodType(
+        lambda self, activations: None, controller
     )
-
-
-def patch_fixed_eps(controller: DSMeZO_Controller) -> None:
-    """Disable adaptive epsilon — keep at initial value."""
-    controller._update_eps = types.MethodType(lambda self: None, controller)
-
-
-def patch_no_masking(controller: DSMeZO_Controller) -> None:
-    """Disable continuous masking by setting warmup beyond total steps."""
-    controller.mask_warmup = controller.total_steps + 1
-
-
-def patch_no_gr(controller: DSMeZO_Controller) -> None:
-    """Disable gradient regularization."""
-    controller.lambda_gr = 0.0
-
-
-def patch_no_kl(controller: DSMeZO_Controller) -> None:
-    """Disable KL constraint."""
-    controller.delta_kl = float('inf')
 
 
 # ── Experiment definitions ──────────────────────────────────────────────────
@@ -242,11 +193,7 @@ EXPERIMENTS: list[dict[str, Any]] = [
     {"name": "control",       "patch": None},
     {"name": "no_zomuon",     "patch": patch_sgd_momentum},
     {"name": "no_agzo",       "patch": patch_random_perturbation},
-    {"name": "no_masking",    "patch": patch_no_masking},
-    {"name": "no_gr",         "patch": patch_no_gr},
-    {"name": "no_kl",         "patch": patch_no_kl},
     {"name": "static_bases",  "patch": patch_static_bases},
-    {"name": "fixed_eps",     "patch": patch_fixed_eps},
 ]
 
 
@@ -310,7 +257,7 @@ def main() -> None:
         )
         results.append(result)
         print(f"  pass@1: {result['pass@1']:.1%} | "
-              f"Loss EMA: {result['loss_ema']:.2e} | "
+              f"DD EMA: {result['dd_ema']:.2e} | "
               f"Time: {result['train_time']:.1f}s")
 
     # Print results
@@ -329,10 +276,10 @@ def main() -> None:
     print("\n" + "=" * 70)
     print(f"ABLATION RESULTS ({TOTAL_STEPS} steps)")
     print("=" * 70)
-    print(f"{'Experiment':<16} | {'pass@1':>7} | {'Loss EMA':>10} | {'dd EMA':>10} | {'Time':>6}")
-    print("-" * 70)
+    print(f"{'Experiment':<16} | {'pass@1':>7} | {'dd EMA':>10} | {'Time':>6}")
+    print("-" * 50)
     for r in results:
-        print(f"{r['name']:<16} | {r['pass@1']:6.1%} | {r['loss_ema']:>10.2e} | {r['dd_ema']:>10.4f} | {r['train_time']:5.1f}s")
+        print(f"{r['name']:<16} | {r['pass@1']:6.1%} | {r['dd_ema']:>10.4f} | {r['train_time']:5.1f}s")
 
     # Delta from control
     ctrl_pass = results[0]["pass@1"]

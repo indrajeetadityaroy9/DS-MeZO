@@ -1,8 +1,8 @@
 """Triton kernels for DS-MeZO controller operations.
 
-Kernel 1: zo_muon_update — fuses gradient computation, continuous cosine-
-    similarity masking, momentum accumulation, Newton-Schulz orthogonalization
-    (5 iter), and parameter update into a single kernel launch per matrix.
+Kernel 1: zo_muon_update — fuses gradient computation, momentum accumulation,
+    Newton-Schulz orthogonalization (5 iter), and parameter update into a
+    single kernel launch per matrix.
 
 Kernel 2: fused_perturb_dual — computes both θ+ = base + z and
     θ- = base - z in a single pass (halves memory traffic).

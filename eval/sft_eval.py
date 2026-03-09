@@ -150,7 +150,7 @@ def main() -> None:
 
         entry = {
             "step": step_idx + 1,
-            "loss_ema": controller.loss_ema,
+            "dd_ema": controller.dd_ema,
             "eta": controller.eta,
             "eps": controller.eps,
         }
@@ -160,9 +160,9 @@ def main() -> None:
             elapsed = time.time() - t_start
             s_per_step = elapsed / (step_idx + 1)
             eta_remain = s_per_step * (args.total_steps - step_idx - 1)
-            loss_str = f"{controller.loss_ema:.4f}"
+            dd_str = f"{controller.dd_ema:.4f}"
             print(f"  step {step_idx+1:4d}/{args.total_steps} | "
-                  f"loss_ema={loss_str} | "
+                  f"dd_ema={dd_str} | "
                   f"lr={controller.eta:.2e} | "
                   f"{s_per_step:.1f}s/step | "
                   f"ETA {eta_remain:.0f}s")
@@ -194,8 +194,7 @@ def main() -> None:
     print(f"  Perplexity delta:     {ppl_delta:+.2f} ({ppl_pct:+.1f}%)")
     print(f"  GSM8K baseline:       {baseline_gsm8k['exact_match']:.1%}")
     print(f"  GSM8K post-training:  {post_gsm8k['exact_match']:.1%}")
-    print(f"  Initial loss EMA:     {controller.initial_loss_ema:.4f}")
-    print(f"  Final loss EMA:       {controller.loss_ema:.4f}")
+    print(f"  Final DD EMA:         {controller.dd_ema:.4f}")
     print(f"  Training time:        {train_time:.1f}s ({train_time/args.total_steps:.1f}s/step)")
     print(f"  Steps completed:      {args.total_steps}")
 

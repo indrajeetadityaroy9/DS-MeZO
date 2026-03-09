@@ -1,17 +1,15 @@
 [build-system]
 requires = ["setuptools>=75.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
 name = "ds-mezo"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "torch==2.10.0",
-    "triton==3.6.0",
     "vllm==0.17.0",
     "safetensors==0.7.0",
-    "transformers==4.51.0",
+    "transformers>=4.56.0,<5",
     "datasets==3.5.0",
     "evaluate==0.4.3",
     "PyYAML==6.0.1",
