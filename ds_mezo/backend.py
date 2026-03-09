@@ -23,9 +23,7 @@ _VLLM_MERGES: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Module-level functions (picklable for collective_rpc)
-# ---------------------------------------------------------------------------
 
 def _register_activation_hooks(
     worker: Any, hook_map: dict[str, list[str]],
@@ -119,9 +117,7 @@ def _save_peft_adapter(
     save_file(tensors, str(adapter_dir / "adapter_model.safetensors"))
 
 
-# ---------------------------------------------------------------------------
 # Backend class
-# ---------------------------------------------------------------------------
 
 class VLLMBackend:
     def __init__(

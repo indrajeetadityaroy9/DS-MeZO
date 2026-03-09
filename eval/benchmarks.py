@@ -24,9 +24,7 @@ from vllm import SamplingParams
 from eval.utils import extract_code, pass_at_k
 
 
-# ---------------------------------------------------------------------------
 # Perplexity — direct NLL measurement on held-out data
-# ---------------------------------------------------------------------------
 
 def eval_perplexity(
     engine: Any,
@@ -60,9 +58,7 @@ def eval_perplexity(
     }
 
 
-# ---------------------------------------------------------------------------
 # GSM8K — 8-shot CoT, two-stage answer extraction, exact match
-# ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=1)
 def _get_gsm8k_fewshot(n_shot: int = 8) -> tuple[dict, ...]:
@@ -158,9 +154,7 @@ def eval_gsm8k(
     return result
 
 
-# ---------------------------------------------------------------------------
 # MBPP — zero-shot docstring format, pass@k via execution
-# ---------------------------------------------------------------------------
 
 def load_mbpp_train() -> list[dict[str, Any]]:
     """Load MBPP sanitized train split with prompts and test metadata."""
@@ -249,9 +243,7 @@ def eval_mbpp(
     return result
 
 
-# ---------------------------------------------------------------------------
 # HumanEval — function completion, pass@k via execution
-# ---------------------------------------------------------------------------
 
 def eval_humaneval(
     engine: Any,

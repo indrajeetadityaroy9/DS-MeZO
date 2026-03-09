@@ -28,9 +28,7 @@ import triton
 import triton.language as tl
 
 
-# ---------------------------------------------------------------------------
 # Kernel 1: Fused ZO-Muon update (gradient + masking + momentum + N-S + param)
-# ---------------------------------------------------------------------------
 
 @triton.jit
 def _zo_muon_tall_kernel(
@@ -228,9 +226,7 @@ def zo_muon_update(param, buf, z, scratch, dd, momentum, eta, mask_scale):
         )
 
 
-# ---------------------------------------------------------------------------
 # Kernel 2: Fused dual perturbation (pos = base + z, neg = base - z)
-# ---------------------------------------------------------------------------
 
 @triton.jit
 def _fused_perturb_dual_kernel(
