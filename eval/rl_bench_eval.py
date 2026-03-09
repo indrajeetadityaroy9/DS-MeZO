@@ -61,7 +61,6 @@ def main() -> None:
         gpu_memory_utilization=0.92,
         enable_lora=True,
         max_lora_rank=max(64, rank),
-        max_num_seqs=8,
         enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")

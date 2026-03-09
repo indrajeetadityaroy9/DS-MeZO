@@ -29,7 +29,9 @@ python -m eval.ablations --model-path <path> --adapter-path <path> --output-dir 
 
 Entry points are also available via `pyproject.toml`: `ds-mezo-train` (→ `scripts.train:main`) and `ds-mezo-pissa` (→ `scripts.prepare_pissa:main`).
 
-A minimal smoke-test config exists at `configs/smoke.yaml` (10 steps, requires PiSSA-prepared model at `/dev/shm/pissa_prep/`). Sample prompts at `prompts/test.jsonl`.
+A minimal smoke-test config exists at `configs/smoke.yaml` (10 steps, requires PiSSA-prepared model at `/dev/shm/pissa_prep/`). Note: `smoke.yaml` omits `output_dir` — it will default to `./output`. Sample prompts at `prompts/test.jsonl`.
+
+**Prompts format**: JSONL with `{"prompt": "..."}` per line.
 
 **Note**: There is no `tests/` directory yet — evaluation is done via the `eval/` scripts.
 
@@ -73,7 +75,7 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Config fields (config YAML surface)
 
-Required: `model_path`, `adapter_path`, `output_dir`. Key optional fields with defaults:
+Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"output"` but should always be set explicitly). Key optional fields with defaults:
 
 | Field | Default | Purpose |
 |:---|:---|:---|
@@ -112,6 +114,14 @@ Epsilon is derived from adapter rank. DD clipping uses adaptive EMA variance tra
 - `VLLM_ALLOW_INSECURE_SERIALIZATION=1` required (set by caller — see `scripts/launch.sh`)
 - `launch.sh` locks GPU clocks (`nvidia-smi -lgc 1980,1980 && nvidia-smi -lmc 2619`), sets `OMP_NUM_THREADS=16`, `MKL_NUM_THREADS=16`, `TOKENIZERS_PARALLELISM=true`, disables TF imports
 - Config files use YAML; `model_path`, `adapter_path`, and `output_dir` are required, all else defaults from `_CONFIG_DEFAULTS`
+
+## Common pitfalls
+
+- **PiSSA A/B swap**: PiSSA `A` maps to PEFT `lora_B.weight` and vice versa. Getting this wrong silently corrupts training. Always check which convention the current code path uses.
+- **Triton rank >= 16**: The fused kernels require adapter rank >= 16 due to Hopper HMMA tile constraints. Smaller ranks will fail at kernel launch.
+- **vLLM serialization**: `VLLM_ALLOW_INSECURE_SERIALIZATION=1` must be set or adapter loading fails silently. `launch.sh` handles this.
+- **Activation calibration**: `controller._calibrate_activation_bases_full()` must be called before `controller.train()`. Skipping it will cause runtime errors in AGZO perturbation.
+- **README vs CLAUDE.md commands**: The README uses direct script paths (`python scripts/prepare_pissa.py`); always use `python -m` module execution instead (`python -m scripts.prepare_pissa`).
 
 ## Design docs
 

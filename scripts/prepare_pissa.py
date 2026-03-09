@@ -95,8 +95,8 @@ def main() -> None:
                     shard_tensors[key] = W_res.to(tensor.dtype)
 
                     # PEFT convention: lora_A = B (r×d_in), lora_B = A (d_out×r)
-                    adapter_tensors[f"{ls.peft_prefix}.lora_A.weight"] = B.bfloat16()
-                    adapter_tensors[f"{ls.peft_prefix}.lora_B.weight"] = A.bfloat16()
+                    adapter_tensors[f"{ls.peft_prefix}.lora_A.weight"] = B.bfloat16().contiguous()
+                    adapter_tensors[f"{ls.peft_prefix}.lora_B.weight"] = A.bfloat16().contiguous()
                     del W0
                 else:
                     shard_tensors[key] = tensor

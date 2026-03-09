@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 import re
 from typing import Any
 
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 import evaluate
 from datasets import load_dataset
 from vllm import SamplingParams
@@ -217,12 +219,12 @@ def eval_mbpp(
         tests = "\n".join(row["test_list"])
         references.append(f"{imports}\n{tests}")
 
-    _, results_list = code_eval.compute(
+    _, results_dict = code_eval.compute(
         references=references, predictions=predictions,
     )
 
-    per_task_correct = [sum(r[1] for r in task) for task in results_list]
-    per_task_n = [len(task) for task in results_list]
+    per_task_correct = [sum(r[1]["passed"] for r in task) for task in results_dict.values()]
+    per_task_n = [len(task) for task in results_dict.values()]
 
     pass_1 = sum(
         pass_at_k(n, c, 1) for n, c in zip(per_task_n, per_task_correct)
@@ -282,12 +284,12 @@ def eval_humaneval(
         predictions.append(completions)
         references.append(row["test"] + f"\ncheck({row['entry_point']})")
 
-    _, results_list = code_eval.compute(
+    _, results_dict = code_eval.compute(
         references=references, predictions=predictions,
     )
 
-    per_task_correct = [sum(r[1] for r in task) for task in results_list]
-    per_task_n = [len(task) for task in results_list]
+    per_task_correct = [sum(r[1]["passed"] for r in task) for task in results_dict.values()]
+    per_task_n = [len(task) for task in results_dict.values()]
 
     pass_1 = sum(
         pass_at_k(n, c, 1) for n, c in zip(per_task_n, per_task_correct)

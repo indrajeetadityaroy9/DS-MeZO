@@ -27,6 +27,7 @@ H100 architecture notes:
     to provide speedup. FP32 CUDA cores are used, which is correct for
     N-S convergence anyway (cubic convergence requires full FP32 precision).
   - Power iteration R=rank/2≈8 — too narrow for Tensor Cores.
+  - tl.dot constraint: contraction dimension K >= 16.
   - Adapter rank >= 16 required: N-S inner products are rank×rank, and tl.dot
     requires contraction dimension >= 16 for Hopper mma.sync instructions.
   - Kernels 1-3 tile sequentially (single-program, grid=(1,)). This is forced
@@ -35,11 +36,9 @@ H100 architecture notes:
     TMA and warp specialization require producer/consumer overlap — not applicable.
   - All data fits in H100's 50MB L2 cache (adapters ~256KB, activations ~8MB).
     Multi-pass sequential reads benefit from L2 residency without TMA.
-  - No tl.make_block_ptr: raw pointer arithmetic is the most stable Triton
-    pattern. Block pointers have known failure modes on Triton 3.6 with
-    staged loop patterns (Hopper-specific compiler issue).
+  - No tl.make_block_ptr: raw pointer arithmetic is the most stable pattern.
   - No experimental APIs (tl.async_copy, tl.experimental.*). Only stable
-    Triton 3.6 primitives: tl.load, tl.store, tl.dot, tl.trans, tl.static_range.
+    primitives: tl.load, tl.store, tl.dot, tl.trans, tl.static_range.
 
 Invariant constants (mathematically fixed, not tunable):
   - Newton-Schulz: X_{k+1} = 0.5 * X_k @ (3I - X_k.T @ X_k)
@@ -49,17 +48,14 @@ Invariant constants (mathematically fixed, not tunable):
   - BLOCK_M=128, BLOCK_N=128: power-of-2 tile sizes for H100 SRAM alignment.
     BLOCK_T=128 for token-dimension tiling in power iteration.
 
-Contracts (structural guarantees from pipeline, not runtime-checked):
-  - All tensor inputs: FP32 dtype, 2D, contiguous (CUDA-only system).
-  - Adapter rank >= 16 (enforced once at controller init). This ensures:
-    * zo_muon_update: min(M,N) >= 16 for N-S tl.dot contraction dimension.
-    * fused_power_iter: R = rank/2 >= 8 for tl.dot output dimension.
-    * fused_agzo_perturbation: RC = rank/2 >= 8 for tl.dot result dimension.
-  - zo_muon_update: param, buf, z, scratch must have identical shape.
-  - fused_power_iter: H is (T, D), V is (D, R). D and R are constexpr.
-  - fused_agzo_perturbation: B is (R, d_in), V is (d_in, RC), z_coeff_B is
-    (R, RC), z_coeff_A is (d_out, RC). R and RC are constexpr.
-  - fused_perturb_dual: base, z, pos, neg must have identical shape and contiguity.
+Tensor conventions:
+  - All inputs: FP32, 2D, contiguous, CUDA.
+  - Adapter rank >= 16 (tl.dot contraction minimum).
+  - zo_muon_update: param, buf, z, scratch — identical shape.
+  - fused_power_iter: H (T, D), V (D, R). D and R are constexpr.
+  - fused_agzo_perturbation: B (R, d_in), V (d_in, RC), z_coeff_B (R, RC),
+    z_coeff_A (d_out, RC). R and RC are constexpr.
+  - fused_perturb_dual: base, z, pos, neg — identical shape.
 
 Reference: DS_MeZO_Combined.md §5.2, §6.1
 """
@@ -244,7 +240,6 @@ def zo_muon_update(
     min(M,N) × min(M,N) inner products (= rank × rank, minimum 16×16).
     """
     M, N = param.shape
-
     if M >= N:
         _zo_muon_tall_kernel[(1,)](
             param, buf, z, scratch,
@@ -307,15 +302,19 @@ def _power_iter_kernel(
             HtHV += tl.dot(tl.trans(H_tile), HV_tile, allow_tf32=False)
 
         # Modified Gram-Schmidt QR on HtHV (D × R) — in registers
+        # Mask-based gather/scatter for column access
         V = HtHV
         for col in tl.static_range(R):
-            v_col = V[:, col]
+            col_mask = (offs_r == col).to(tl.float32)
+            v_col = tl.sum(V * col_mask[None, :], axis=1)
             for prev in tl.static_range(col):
-                q_prev = V[:, prev]
+                prev_mask = (offs_r == prev).to(tl.float32)
+                q_prev = tl.sum(V * prev_mask[None, :], axis=1)
                 dot_val = tl.sum(v_col * q_prev)
                 v_col = v_col - dot_val * q_prev
             norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), 1e-16))
-            V[:, col] = v_col / norm
+            v_col = v_col / norm
+            V = V * (1.0 - col_mask[None, :]) + v_col[:, None] * col_mask[None, :]
 
     tl.store(
         out_ptr + offs_d[:, None] * stride_od + offs_r[None, :] * stride_or,
@@ -330,24 +329,35 @@ def fused_power_iter(
 ) -> torch.Tensor:
     """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
 
-    Replaces 3×(matmul + matmul + QR) = 9 kernel launches per layer
-    with a single launch. H: (T, D), V: (D, R). At D=4096, register
-    state spills to L1 (still on-chip, ~2TB/s).
+    Uses Triton kernel when D and R are powers of 2 and fit in shared memory.
+    Falls back to PyTorch matmul + QR otherwise (e.g. D=1536 for Qwen2).
+    H: (T, D), V: (D, R).
     """
     T, D = H.shape
     _, R = V.shape
-    out = torch.empty(D, R, device="cuda", dtype=torch.float32)
 
-    _power_iter_kernel[(1,)](
-        H, V, out,
-        T, D=D, R=R,
-        stride_ht=H.stride(0), stride_hd=H.stride(1),
-        stride_vd=V.stride(0), stride_vr=V.stride(1),
-        stride_od=out.stride(0), stride_or=out.stride(1),
-        num_iters=num_iters,
-        BLOCK_T=128,
-    )
-    return out
+    d_is_po2 = (D & (D - 1)) == 0
+    r_is_po2 = (R & (R - 1)) == 0
+
+    if d_is_po2 and r_is_po2:
+        out = torch.empty(D, R, device="cuda", dtype=torch.float32)
+        _power_iter_kernel[(1,)](
+            H, V, out,
+            T, D=D, R=R,
+            stride_ht=H.stride(0), stride_hd=H.stride(1),
+            stride_vd=V.stride(0), stride_vr=V.stride(1),
+            stride_od=out.stride(0), stride_or=out.stride(1),
+            num_iters=num_iters,
+            BLOCK_T=128,
+        )
+        return out
+
+    # PyTorch fallback for non-power-of-2 dimensions
+    for _ in range(num_iters):
+        HV = H @ V
+        V = H.T @ HV
+        V, _ = torch.linalg.qr(V)
+    return V
 
 
 # ── Kernel 3: Fused AGZO perturbation ─────────────────────────────────────
@@ -404,9 +414,13 @@ def _agzo_perturb_kernel(
 
         # z_B_tile = zcb @ V_tile.T = (R, RC) @ (RC, BLOCK_D) = (R, BLOCK_D)
         # Manual rank-1 accumulation over RC (too small for tl.dot)
+        # Mask-based column extraction
         z_B_tile = tl.zeros([R, BLOCK_D], dtype=tl.float32)
         for k in tl.static_range(RC):
-            z_B_tile += zcb[:, k][:, None] * V_tile[:, k][None, :]
+            k_mask = (offs_rc == k).to(tl.float32)
+            zcb_k = tl.sum(zcb * k_mask[None, :], axis=1)        # (R,)
+            V_k = tl.sum(V_tile * k_mask[None, :], axis=1)       # (BLOCK_D,)
+            z_B_tile += zcb_k[:, None] * V_k[None, :]
         z_B_tile *= eps
 
         # Store z_B chunk
@@ -425,15 +439,19 @@ def _agzo_perturb_kernel(
         BV += tl.dot(B_tile, V_tile, allow_tf32=False)
 
     # Phase 2: Modified Gram-Schmidt QR on BV (R, RC) — in registers
+    # Uses mask-based gather/scatter (Triton 3.6.0 disallows Q[:, col] indexing)
     Q = BV
     for col in tl.static_range(RC):
-        v_col = Q[:, col]
+        col_mask = (offs_rc == col).to(tl.float32)
+        v_col = tl.sum(Q * col_mask[None, :], axis=1)
         for prev in tl.static_range(col):
-            q_prev = Q[:, prev]
+            prev_mask = (offs_rc == prev).to(tl.float32)
+            q_prev = tl.sum(Q * prev_mask[None, :], axis=1)
             dot_val = tl.sum(v_col * q_prev)
             v_col = v_col - dot_val * q_prev
         norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), 1e-16))
-        Q[:, col] = v_col / norm
+        v_col = v_col / norm
+        Q = Q * (1.0 - col_mask[None, :]) + v_col[:, None] * col_mask[None, :]
 
     # Phase 3: tile over d_out
     num_dout_chunks = tl.cdiv(d_out, BLOCK_D)
@@ -451,9 +469,13 @@ def _agzo_perturb_kernel(
 
         # z_A_tile = zca_tile @ Q.T = (BLOCK_D, RC) @ (RC, R) = (BLOCK_D, R)
         # Manual rank-1 accumulation over RC
+        # Mask-based column extraction
         z_A_tile = tl.zeros([BLOCK_D, R], dtype=tl.float32)
         for k in tl.static_range(RC):
-            z_A_tile += zca_tile[:, k][:, None] * Q[:, k][None, :]
+            k_mask = (offs_rc == k).to(tl.float32)
+            zca_k = tl.sum(zca_tile * k_mask[None, :], axis=1)   # (BLOCK_D,)
+            Q_k = tl.sum(Q * k_mask[None, :], axis=1)            # (R,)
+            z_A_tile += zca_k[:, None] * Q_k[None, :]
         z_A_tile *= eps
 
         # Store z_A chunk
@@ -476,6 +498,9 @@ def fused_agzo_perturbation(
     Q = QR(BV), z_A = (z_coeff_A @ Q.T) * eps. Fuses 6 launches into 1.
     B: (R, d_in), V: (d_in, RC), z_coeff_B: (R, RC), z_coeff_A: (d_out, RC).
     Returns (z_A, z_B) where z_A is (d_out, R) and z_B is (R, d_in).
+
+    Note: z_coeff_B and z_coeff_A must be contiguous — the kernel indexes
+    them with hardcoded stride=(cols, 1) matching the constexpr RC dimension.
     """
     R, d_in = B.shape
     _, RC = V.shape
@@ -528,6 +553,7 @@ def fused_perturb_dual(
     """Fused dual perturbation: pos = base + z, neg = base - z.
 
     Writes into pre-allocated pos and neg buffers.
+    Inputs must not alias outputs (no in-place: base != pos, z != neg, etc.).
     """
     N = base.numel()
     BLOCK = 1024

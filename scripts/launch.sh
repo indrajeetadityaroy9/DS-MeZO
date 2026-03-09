@@ -1,7 +1,5 @@
 #!/bin/bash
 sudo nvidia-smi -lgc 1980,1980 && sudo nvidia-smi -lmc 2619
-export USE_TF=0
-export TRANSFORMERS_NO_TF=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export OMP_NUM_THREADS=16
 export MKL_NUM_THREADS=16

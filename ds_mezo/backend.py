@@ -2,6 +2,10 @@
 
 The controller calls backend methods that return plain Python types,
 keeping the algorithm completely vLLM-free.
+
+Adapter hot-swap writes to tmpfs (staging_dir, default /dev/shm/ds_mezo)
+for zero-copy loading by vLLM. Activation extraction uses collective_rpc
+forward hooks.
 """
 
 from __future__ import annotations
@@ -61,7 +65,8 @@ def _collect_and_remove_hooks(
     worker: Any,
 ) -> dict[tuple[int, str], torch.Tensor]:
     """Collect activations and remove hooks."""
-    activations = worker._ds_mezo_activations
+    # .cpu() required: collective_rpc serializes returns across process boundary
+    activations = {k: v.cpu() for k, v in worker._ds_mezo_activations.items()}
     for h in worker._ds_mezo_hooks:
         h.remove()
     worker._ds_mezo_hooks = []
@@ -107,6 +112,8 @@ def _save_peft_adapter(
     PiSSA convention: W = W_res + A @ B where A:(d_out, r), B:(r, d_in)
     PEFT convention:  W = W0 + lora_B @ lora_A where lora_A:(r, d_in), lora_B:(d_out, r)
     Therefore: lora_A.weight = B, lora_B.weight = A
+
+    Writes to staging_dir (tmpfs) for zero-copy vLLM loading.
     """
     tensors: dict[str, torch.Tensor] = {}
     for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
@@ -125,6 +132,7 @@ class VLLMBackend:
         staging_dir: Path | str = Path("/dev/shm/ds_mezo"),
     ) -> None:
         self.engine = engine
+        self.rank = rank
 
         # Build hook_map from target modules + vLLM merge knowledge
         hook_map: dict[str, set[str]] = {}
@@ -135,15 +143,14 @@ class VLLMBackend:
             k: sorted(v) for k, v in hook_map.items()
         }
 
-        # Adapter staging — ephemeral directory for vLLM adapter hot-swap
-        # Dirs created idempotently; adapter files are overwritten on each sync.
+        # Adapter staging on tmpfs for zero-copy vLLM loading
+        unique_modules = sorted({ls.module_name for ls in layer_specs})
         staging = Path(staging_dir)
         (staging / "adapter_pos").mkdir(parents=True, exist_ok=True)
         (staging / "adapter_neg").mkdir(parents=True, exist_ok=True)
         self.adapter_dir_pos = staging / "adapter_pos"
         self.adapter_dir_neg = staging / "adapter_neg"
 
-        unique_modules = sorted({ls.module_name for ls in layer_specs})
         _write_adapter_config(self.adapter_dir_pos, rank, unique_modules)
         _write_adapter_config(self.adapter_dir_neg, rank, unique_modules)
 
@@ -160,7 +167,11 @@ class VLLMBackend:
         neg_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         layers: list[Any],
     ) -> None:
-        """Serialize PiSSA adapters to staging directory for vLLM."""
+        """Sync PiSSA adapters to vLLM engine via tmpfs staging.
+
+        Writes safetensors to staging_dir (tmpfs, RAM-backed) then triggers
+        vLLM adapter reload. load_inplace=True enables zero-copy mmap loading.
+        """
         def get_AB(
             overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -176,10 +187,14 @@ class VLLMBackend:
             return A_list, B_list
 
         A_pos, B_pos = get_AB(pos_overrides)
-        _save_peft_adapter(A_pos, B_pos, self.adapter_dir_pos, layers)
-
         A_neg, B_neg = get_AB(neg_overrides)
+
+        _save_peft_adapter(A_pos, B_pos, self.adapter_dir_pos, layers)
         _save_peft_adapter(A_neg, B_neg, self.adapter_dir_neg, layers)
+
+        # Reload adapters from tmpfs (no inference, direct API)
+        self.engine.llm_engine.add_lora(self.lora_pos)
+        self.engine.llm_engine.add_lora(self.lora_neg)
 
     def generate(
         self, batch: list[str], temperature: float, n: int,
@@ -207,12 +222,12 @@ class VLLMBackend:
         self, input_data: list[str],
     ) -> dict[tuple[int, str], torch.Tensor]:
         """Hook-based activation capture. Returns {(layer_idx, module_name): Tensor}."""
-        self.engine.llm_engine.collective_rpc(
+        self.engine.collective_rpc(
             _register_activation_hooks, args=(self.hook_map,)
         )
         self.engine.generate(
             input_data,
             SamplingParams(max_tokens=1, temperature=0.0),
         )
-        results = self.engine.llm_engine.collective_rpc(_collect_and_remove_hooks)
+        results = self.engine.collective_rpc(_collect_and_remove_hooks)
         return results[0]

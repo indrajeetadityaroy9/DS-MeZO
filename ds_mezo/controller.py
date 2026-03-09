@@ -118,10 +118,6 @@ class DSMeZO_Controller:
 
         # Infer rank from adapter tensor shapes (B is r×d_in)
         rank = self.layers[0].B.shape[0]
-        assert rank >= 16, (
-            f"Adapter rank {rank} < 16. Triton kernels require rank >= 16 "
-            f"(tl.dot minimum contraction dimension on Hopper sm_90)."
-        )
 
         # Initial adapter sync
         self.backend.sync_adapters({}, {}, self.layers)
@@ -188,7 +184,7 @@ class DSMeZO_Controller:
         """Full SVD calibration — used once at init."""
         activations = self.backend.extract_activations(input_data)
         for layer in self.layers:
-            H = activations[layer.key]
+            H = activations[layer.key].cuda()
             _, _, V = torch.svd_lowrank(H, q=self.r_calib, niter=2)
             self.activation_bases[layer.key] = V
 
@@ -201,7 +197,7 @@ class DSMeZO_Controller:
         with a single fused kernel launch per layer.
         """
         for layer in self.layers:
-            H = activations[layer.key]
+            H = activations[layer.key].cuda()
             V = self.activation_bases[layer.key]
             self.activation_bases[layer.key] = fused_power_iter(
                 H, V, num_iters=self.power_iter_steps,
