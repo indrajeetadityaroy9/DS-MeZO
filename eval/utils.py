@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Callable
 
 
 def extract_code(text: str) -> str:
@@ -33,25 +34,29 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
-class ExecReward:
-    """Execution-based reward: fraction of test assertions passing."""
+def make_exec_reward() -> tuple[Callable[[str], float], Callable[[list[str], list[str]], None]]:
+    """Execution-based reward: fraction of test assertions passing.
 
-    def __init__(self) -> None:
-        self.tests: list[str] = []
-        self.imports: list[str] = []
+    Returns (reward_fn, set_problem_fn).
+    reward_fn(text) -> float: score generated code against current tests.
+    set_problem_fn(tests, imports): set tests/imports for current problem.
+    """
+    state: dict[str, list[str]] = {"tests": [], "imports": []}
 
-    def set_problem(self, tests: list[str], imports: list[str]) -> None:
-        self.tests = tests
-        self.imports = imports
+    def set_problem(tests: list[str], imports: list[str]) -> None:
+        state["tests"] = tests
+        state["imports"] = imports
 
-    def __call__(self, text: str) -> float:
+    def reward(text: str) -> float:
         code = extract_code(text)
-        import_block = "\n".join(self.imports)
+        import_block = "\n".join(state["imports"])
         passed = 0
-        for test in self.tests:
+        for test in state["tests"]:
             try:
                 exec(f"{import_block}\n{code}\n{test}", {})
                 passed += 1
             except Exception:
                 pass
-        return passed / len(self.tests)
+        return passed / len(state["tests"])
+
+    return reward, set_problem

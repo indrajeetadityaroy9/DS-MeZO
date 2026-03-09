@@ -7,7 +7,6 @@ keeping the algorithm completely vLLM-free.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +49,7 @@ def _register_activation_hooks(
             mod: Any, inp: tuple[torch.Tensor, ...], out: Any,
             ks: list[tuple[int, str]] = keys,
         ) -> None:
-            act = inp[0].detach().float().cpu()
+            act = inp[0].detach().float()
             for k in ks:
                 worker._ds_mezo_activations[k] = act
 
@@ -109,11 +108,12 @@ def _save_peft_adapter(
     PEFT convention:  W = W0 + lora_B @ lora_A where lora_A:(r, d_in), lora_B:(d_out, r)
     Therefore: lora_A.weight = B, lora_B.weight = A
     """
-    tensors = {}
+    tensors: dict[str, torch.Tensor] = {}
     for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
         prefix = layers[layer_idx].peft_prefix
-        tensors[f"{prefix}.lora_A.weight"] = B_l.bfloat16()
-        tensors[f"{prefix}.lora_B.weight"] = A_l.bfloat16()
+        tensors[f"{prefix}.lora_A.weight"] = B_l.contiguous().bfloat16()
+        tensors[f"{prefix}.lora_B.weight"] = A_l.contiguous().bfloat16()
+
     save_file(tensors, str(adapter_dir / "adapter_model.safetensors"))
 
 
@@ -136,11 +136,10 @@ class VLLMBackend:
         }
 
         # Adapter staging — ephemeral directory for vLLM adapter hot-swap
+        # Dirs created idempotently; adapter files are overwritten on each sync.
         staging = Path(staging_dir)
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.joinpath("adapter_pos").mkdir(parents=True)
-        staging.joinpath("adapter_neg").mkdir(parents=True)
+        (staging / "adapter_pos").mkdir(parents=True, exist_ok=True)
+        (staging / "adapter_neg").mkdir(parents=True, exist_ok=True)
         self.adapter_dir_pos = staging / "adapter_pos"
         self.adapter_dir_neg = staging / "adapter_neg"
 

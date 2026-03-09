@@ -18,57 +18,43 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 from safetensors.torch import load_file, save_file
 from ds_mezo.backend import _save_peft_adapter, _write_adapter_config
-from ds_mezo.kernels import zo_muon_update, fused_perturb_dual
+from ds_mezo.kernels import zo_muon_update, fused_power_iter, fused_agzo_perturbation, fused_perturb_dual
 from ds_mezo.model_config import LayerSpec
+
+# Config defaults — matches YAML config surface.
+# Auto-calibrated parameters (derived from adapter/data):
+#   rank: inferred from adapter tensor shapes
+#   r_calib: rank // 2 (dominant activation subspace)
+#   T_min: T_max / num_candidates (maintain RLOO diversity)
+#   eps: 1e-3 / sqrt(rank) (SPSA theory — Spall 1998)
+#   EMA: adaptive window from step count (VA-Muon — 2601.14603)
+#   DD clipping: 3-sigma from tracked variance (ZClip — 2504.02507)
+_CONFIG_DEFAULTS: dict[str, Any] = {
+    "output_dir": "output",
+    "staging_dir": "/dev/shm/ds_mezo",
+    "adapter_path": "",
+    "model_path": "",
+    "total_steps": 1000,
+    "hybrid_switch_step": 0,
+    "eta_max": 1e-4,
+    "momentum": 0.9,
+    "num_candidates": 4,
+    "T_max": 1.0,
+    "seed": 42,
+    "score_fn": None,
+}
 
 
 def _mean_nll(logprobs: list[float]) -> float:
     """Mean negative log-likelihood over tokens."""
     return -sum(logprobs) / len(logprobs)
-
-
-@dataclass
-class DSMeZOConfig:
-    """Configuration for DS-MeZO controller.
-
-    Auto-calibrated parameters (derived from adapter, data, or other config):
-    - rank: inferred from adapter tensor shapes
-    - r_calib: rank // 2 (half adapter rank captures dominant activation subspace)
-    - T_min: T_max / num_candidates (maintain diversity for RLOO)
-    - eta_min: 0 (cosine decay to zero, per D2Z findings — CoLLAs 2025)
-    - eps: 1e-3 / sqrt(rank) (SPSA theory — Spall 1998)
-    - EMA factors: adaptive window from step count (VA-Muon — 2601.14603)
-    - DD clipping: 3-sigma from tracked variance (ZClip — 2504.02507)
-    """
-    # Paths
-    output_dir: str = "output"
-    staging_dir: str = "/dev/shm/ds_mezo"
-    adapter_path: str = ""
-    model_path: str = ""
-
-    # Training
-    total_steps: int = 1000
-    hybrid_switch_step: int = 0
-    eta_max: float = 1e-4
-    momentum: float = 0.9
-    num_candidates: int = 4
-    T_max: float = 1.0
-    seed: int = 42
-    score_fn: Callable[[str], float] | None = field(default=None, repr=False)
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> DSMeZOConfig:
-        """Create config from dict, ignoring unknown keys."""
-        valid = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in valid})
 
 
 @dataclass
@@ -93,25 +79,27 @@ class DSMeZO_Controller:
         config: dict[str, Any],
     ) -> None:
         self.backend = backend
-        cfg = DSMeZOConfig.from_dict(config)
 
-        self.score_fn = cfg.score_fn
+        # Merge caller config over defaults (unknown keys silently ignored)
+        cfg = {k: config.get(k, v) for k, v in _CONFIG_DEFAULTS.items()}
+
+        self.score_fn: Callable[[str], float] | None = cfg["score_fn"]
         self.step_count = 0
-        self.total_steps = cfg.total_steps
-        self.hybrid_switch_step = cfg.hybrid_switch_step
+        self.total_steps: int = cfg["total_steps"]
+        self.hybrid_switch_step: int = cfg["hybrid_switch_step"]
 
         # Output directory — single root for all persistent artifacts
-        self.output_dir = Path(cfg.output_dir)
+        self.output_dir = Path(cfg["output_dir"])
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Deterministic RNG for reproducible perturbations
         self.rng = torch.Generator(device="cuda")
-        self.rng.manual_seed(cfg.seed)
+        self.rng.manual_seed(cfg["seed"])
 
         # Load pre-computed PiSSA adapter into FP32 master weights on GPU
         adapter_tensors = load_file(
-            str(Path(cfg.adapter_path) / "adapter_model.safetensors"),
+            str(Path(cfg["adapter_path"]) / "adapter_model.safetensors"),
             device="cuda",
         )
 
@@ -130,13 +118,17 @@ class DSMeZO_Controller:
 
         # Infer rank from adapter tensor shapes (B is r×d_in)
         rank = self.layers[0].B.shape[0]
+        assert rank >= 16, (
+            f"Adapter rank {rank} < 16. Triton kernels require rank >= 16 "
+            f"(tl.dot minimum contraction dimension on Hopper sm_90)."
+        )
 
         # Initial adapter sync
         self.backend.sync_adapters({}, {}, self.layers)
 
         # Exploration — cosine temperature annealing (§7.3)
-        self.num_candidates = cfg.num_candidates
-        self.T_max = cfg.T_max
+        self.num_candidates: int = cfg["num_candidates"]
+        self.T_max: float = cfg["T_max"]
         self.T_min = self.T_max / self.num_candidates
         self.explore_temperature = self.T_max
 
@@ -145,13 +137,15 @@ class DSMeZO_Controller:
         self.eps = 1e-3 / math.sqrt(rank)
 
         # Optimizer: ZO-Muon (§5)
-        self.eta_max = cfg.eta_max
+        self.eta_max: float = cfg["eta_max"]
         self.eta = self.eta_max
-        self.momentum = cfg.momentum
+        self.momentum: float = cfg["momentum"]
 
-        # Pre-allocate momentum and scratch buffers
+        # Pre-allocate momentum, scratch, and perturbation output buffers
         self.momentum_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.scratch_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
+        self.pos_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
+        self.neg_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         for layer in self.layers:
             key_A = (layer.key, "A")
             key_B = (layer.key, "B")
@@ -159,6 +153,10 @@ class DSMeZO_Controller:
             self.momentum_buffers[key_B] = torch.zeros_like(layer.B)
             self.scratch_buffers[key_A] = torch.zeros_like(layer.A)
             self.scratch_buffers[key_B] = torch.zeros_like(layer.B)
+            self.pos_buffers[key_A] = torch.empty_like(layer.A)
+            self.pos_buffers[key_B] = torch.empty_like(layer.B)
+            self.neg_buffers[key_A] = torch.empty_like(layer.A)
+            self.neg_buffers[key_B] = torch.empty_like(layer.B)
 
         # Activation subspace tracking — per-step power iteration (§3.5)
         # r_calib = rank/2: top half of singular spectrum captures >80% of variance
@@ -192,40 +190,43 @@ class DSMeZO_Controller:
         for layer in self.layers:
             H = activations[layer.key]
             _, _, V = torch.svd_lowrank(H, q=self.r_calib, niter=2)
-            self.activation_bases[layer.key] = V.float()
+            self.activation_bases[layer.key] = V
 
     def _update_activation_bases(
         self, activations: dict[tuple[int, str], torch.Tensor],
     ) -> None:
-        """Warm-started power iteration (cubic convergence)."""
+        """Warm-started power iteration via fused Triton kernel.
+
+        Replaces 3× (matmul + matmul + QR) = 9 kernel launches per layer
+        with a single fused kernel launch per layer.
+        """
         for layer in self.layers:
-            H = activations[layer.key].float()
-            V = self.activation_bases[layer.key].clone()
-            for _ in range(self.power_iter_steps):
-                V = H.T @ (H @ V)
-                V, _ = torch.linalg.qr(V)
-            self.activation_bases[layer.key] = V
+            H = activations[layer.key]
+            V = self.activation_bases[layer.key]
+            self.activation_bases[layer.key] = fused_power_iter(
+                H, V, num_iters=self.power_iter_steps,
+            )
 
     # -- Perturbation (§3.2) ------------------------------------------------
 
     def _get_perturbation(self, layer: LayerState) -> tuple[torch.Tensor, torch.Tensor]:
-        """AGZO subspace perturbation for A and B."""
+        """AGZO subspace perturbation for A and B via fused Triton kernel.
+
+        B perturbation: project random coefficients into activation subspace V.
+        A perturbation: project into B's column space via QR(B @ V).
+        Single kernel: matmuls + MGS QR + scaling fused, eliminates cuSOLVER overhead.
+        """
         A, B = layer.A, layer.B
-        V_l = self.activation_bases[layer.key].cuda()
+        V_l = self.activation_bases[layer.key]
 
         z_coeff_B = torch.randn(
             B.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         )
-        z_B = z_coeff_B @ V_l.T
-
-        BV = B @ V_l
-        Q, _ = torch.linalg.qr(BV)
         z_coeff_A = torch.randn(
-            A.shape[0], Q.shape[1], device="cuda", generator=self.rng,
+            A.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         )
-        z_A = z_coeff_A @ Q.T
 
-        return z_A * self.eps, z_B * self.eps
+        return fused_agzo_perturbation(B, V_l, z_coeff_B, z_coeff_A, self.eps)
 
     # -- Scoring (§4.3) -----------------------------------------------------
 
@@ -238,7 +239,8 @@ class DSMeZO_Controller:
         """Advantage-weighted NLL scoring.
 
         When RLOO advantages are both zero (all candidates scored equally),
-        falls back to NLL on the best candidate.
+        the weighted sum produces zero loss for both perturbations, giving
+        dd = 0 and no parameter update — the correct behavior.
         """
         winner_tokens, loser_tokens = trajectories
         adv_w, adv_l = advantages
@@ -247,12 +249,8 @@ class DSMeZO_Controller:
         lp_pos = [lp[prompt_len:] for lp in self.backend.score(seqs, self.backend.lora_pos)]
         lp_neg = [lp[prompt_len:] for lp in self.backend.score(seqs, self.backend.lora_neg)]
 
-        if adv_w == 0 and adv_l == 0:
-            loss_pos = _mean_nll(lp_pos[0])
-            loss_neg = _mean_nll(lp_neg[0])
-        else:
-            loss_pos = adv_w * _mean_nll(lp_pos[0]) + adv_l * _mean_nll(lp_pos[1])
-            loss_neg = adv_w * _mean_nll(lp_neg[0]) + adv_l * _mean_nll(lp_neg[1])
+        loss_pos = adv_w * _mean_nll(lp_pos[0]) + adv_l * _mean_nll(lp_pos[1])
+        loss_neg = adv_w * _mean_nll(lp_neg[0]) + adv_l * _mean_nll(lp_neg[1])
 
         return loss_pos, loss_neg
 
@@ -308,12 +306,13 @@ class DSMeZO_Controller:
         adv_l = worst_reward - (total_reward - worst_reward) / (N - 1)
 
         # Normalize by reward standard deviation (REINFORCE++)
+        # Epsilon-stabilized: when all rewards are equal, advantages are already
+        # zero, so dividing by ~0 still gives ~0 without NaN.
         mean_r = total_reward / N
         reward_var = sum((r - mean_r) ** 2 for r in all_rewards) / N
-        reward_std = reward_var ** 0.5
-        if reward_std > 0:
-            adv_w /= reward_std
-            adv_l /= reward_std
+        reward_std = reward_var ** 0.5 + 1e-8
+        adv_w /= reward_std
+        adv_l /= reward_std
 
         winner_full = list(prompt_token_ids) + list(best_output.token_ids)
         loser_full = list(prompt_token_ids) + list(worst_output.token_ids)
@@ -365,10 +364,8 @@ class DSMeZO_Controller:
         if use_rl_loss:
             trajectories, advantages, prompt_len = self._explore(batch)
 
-        # Activation tracking
+        # Activation tracking (bases must be calibrated before first step)
         input_for_activations = batch if isinstance(batch, list) else [batch["prompt_text"]]
-        if not self.activation_bases:
-            self._calibrate_activation_bases_full(input_for_activations)
         batch_activations = self.backend.extract_activations(input_for_activations)
         self._update_activation_bases(batch_activations)
 
@@ -377,17 +374,17 @@ class DSMeZO_Controller:
         for layer in self.layers:
             perturbations[layer.key] = self._get_perturbation(layer)
 
-        # Dual perturbation via fused kernel
+        # Dual perturbation: θ+ = base + z, θ- = base - z (fused kernel)
         pos_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            pos_A, neg_A = torch.empty_like(layer.A), torch.empty_like(layer.A)
-            pos_B, neg_B = torch.empty_like(layer.B), torch.empty_like(layer.B)
-            fused_perturb_dual(layer.A, z_A, pos_A, neg_A)
-            fused_perturb_dual(layer.B, z_B, pos_B, neg_B)
-            pos_layers[layer.key] = (pos_A, pos_B)
-            neg_layers[layer.key] = (neg_A, neg_B)
+            key_A = (layer.key, "A")
+            key_B = (layer.key, "B")
+            fused_perturb_dual(layer.A, z_A, self.pos_buffers[key_A], self.neg_buffers[key_A])
+            fused_perturb_dual(layer.B, z_B, self.pos_buffers[key_B], self.neg_buffers[key_B])
+            pos_layers[layer.key] = (self.pos_buffers[key_A], self.pos_buffers[key_B])
+            neg_layers[layer.key] = (self.neg_buffers[key_A], self.neg_buffers[key_B])
 
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
 
@@ -408,10 +405,10 @@ class DSMeZO_Controller:
             key_B = (layer.key, "B")
             zo_muon_update(layer.A, self.momentum_buffers[key_A],
                            z_A, self.scratch_buffers[key_A],
-                           dd, self.momentum, effective_eta, mask_scale=1.0)
+                           dd, self.momentum, effective_eta)
             zo_muon_update(layer.B, self.momentum_buffers[key_B],
                            z_B, self.scratch_buffers[key_B],
-                           dd, self.momentum, effective_eta, mask_scale=1.0)
+                           dd, self.momentum, effective_eta)
 
         # Schedule updates
         self._update_lr()
@@ -422,28 +419,27 @@ class DSMeZO_Controller:
 
     def train(
         self,
-        rl_data: list[str] | None = None,
+        rl_data: list[str],
         sft_data: list[dict[str, Any]] | None = None,
     ) -> None:
         """Train for total_steps.
 
-        rl_data: list of prompt strings for RL steps.
+        rl_data: list of prompt strings for RL steps (required).
         sft_data: list of dicts with {token_ids, prompt_len, prompt_text} for SFT steps.
+            Required when hybrid_switch_step > 0.
 
         Steps 1..hybrid_switch_step use SFT loss on sft_data.
         Steps hybrid_switch_step+1..total_steps use RL loss on rl_data.
-        """
-        # Calibrate activation bases from first available data (skip if loaded from checkpoint)
-        if not self.activation_bases:
-            first_text = sft_data[0]["prompt_text"] if sft_data else rl_data[0]
-            self._calibrate_activation_bases_full([first_text])
 
+        Activation bases must be calibrated via _calibrate_activation_bases_full()
+        before calling train().
+        """
         # Log every ~1% of training, checkpoint every ~10%
         log_interval = max(1, self.total_steps // 100)
         ckpt_interval = max(1, self.total_steps // 10)
 
         for step_idx in range(self.step_count, self.total_steps):
-            if step_idx < self.hybrid_switch_step and sft_data:
+            if step_idx < self.hybrid_switch_step:
                 batch = sft_data[step_idx % len(sft_data)]
             else:
                 batch = [rl_data[(step_idx - self.hybrid_switch_step) % len(rl_data)]]
@@ -477,15 +473,15 @@ class DSMeZO_Controller:
         _write_adapter_config(step_dir, rank, target_modules)
 
         # Optimizer tensors (FP32) — flatten tuple keys to dot-separated strings
+        # safetensors handles GPU→disk transfer internally via Rust backend
         tensors: dict[str, torch.Tensor] = {}
         for layer in self.layers:
             idx, mod = layer.layer_idx, layer.module_name
-            tensors[f"master.layer{idx}.{mod}.A"] = layer.A.cpu()
-            tensors[f"master.layer{idx}.{mod}.B"] = layer.B.cpu()
-            tensors[f"momentum.layer{idx}.{mod}.A"] = self.momentum_buffers[(layer.key, "A")].cpu()
-            tensors[f"momentum.layer{idx}.{mod}.B"] = self.momentum_buffers[(layer.key, "B")].cpu()
-            if layer.key in self.activation_bases:
-                tensors[f"act_basis.layer{idx}.{mod}"] = self.activation_bases[layer.key].cpu()
+            tensors[f"master.layer{idx}.{mod}.A"] = layer.A
+            tensors[f"master.layer{idx}.{mod}.B"] = layer.B
+            tensors[f"momentum.layer{idx}.{mod}.A"] = self.momentum_buffers[(layer.key, "A")]
+            tensors[f"momentum.layer{idx}.{mod}.B"] = self.momentum_buffers[(layer.key, "B")]
+            tensors[f"act_basis.layer{idx}.{mod}"] = self.activation_bases[layer.key]
         tensors["rng_state"] = self.rng.get_state()
         save_file(tensors, str(step_dir / "optimizer_state.safetensors"))
 
@@ -502,9 +498,7 @@ class DSMeZO_Controller:
 
         # Overwrite latest adapter at output_dir/adapter
         adapter_dir = self.output_dir / "adapter"
-        if adapter_dir.exists():
-            shutil.rmtree(adapter_dir)
-        adapter_dir.mkdir(parents=True)
+        adapter_dir.mkdir(parents=True, exist_ok=True)
         _save_peft_adapter(A_list, B_list, adapter_dir, self.layers)
         _write_adapter_config(adapter_dir, rank, target_modules)
 
@@ -532,10 +526,9 @@ class DSMeZO_Controller:
             layer.B.copy_(opt[f"master.layer{idx}.{mod}.B"])
             self.momentum_buffers[(layer.key, "A")].copy_(opt[f"momentum.layer{idx}.{mod}.A"])
             self.momentum_buffers[(layer.key, "B")].copy_(opt[f"momentum.layer{idx}.{mod}.B"])
-            basis_key = f"act_basis.layer{idx}.{mod}"
-            if basis_key in opt:
-                self.activation_bases[layer.key] = opt[basis_key]
+            self.activation_bases[layer.key] = opt[f"act_basis.layer{idx}.{mod}"]
 
+        # Generator.set_state() requires CPU ByteTensor (PyTorch API constraint)
         self.rng.set_state(opt["rng_state"].cpu())
 
         self.backend.sync_adapters({}, {}, self.layers)

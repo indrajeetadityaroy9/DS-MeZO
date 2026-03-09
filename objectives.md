@@ -14,8 +14,8 @@ Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x mo
 
 1. A complete ZO-RL training pipeline (AGZO + ZO-Muon + RLOO) that runs on a single H100 with ~0.8% memory overhead beyond inference
 2. Activation-guided subspace perturbation (AGZO) reducing effective ZO dimensionality by ~8x
-3. Fused Triton kernels for ZO-Muon spectral update (Newton-Schulz orthogonalization + momentum-aligned masking)
-4. Empirical validation: Llama-3.1-8B MBPP pass@1 improvement (+0.4%) via execution-based RL reward, no backpropagation
+3. Four fused Triton kernels: ZO-Muon spectral update, power iteration, AGZO perturbation, dual perturbation
+4. Empirical validation: Llama-3.1-8B MBPP pass@1 improvement via execution-based RL reward, no backpropagation
 
 **Stated baselines (for memory comparison, not accuracy):**
 
@@ -31,24 +31,20 @@ Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x mo
 
 ### 2.1 Core Algorithm (Novel — must be preserved)
 
-| Mechanism | Spec Section | File:Function | Role |
-|:----------|:-------------|:--------------|:-----|
-| **SPSA gradient estimation** | §2 | `controller.py:step()` L399-400 | `dd = (loss_pos - loss_neg) / (2*eps)` — scalar directional derivative shared across all layers |
-| **AGZO subspace perturbation** | §3.2 | `controller.py:_get_perturbation()` | Projects perturbations into activation subspace (B) and B's column space (A). Reduces effective dims ~8x |
-| **Activation subspace tracking** | §3.5 | `controller.py:_calibrate_activation_bases_full()`, `_update_activation_bases_power_iter()` | Full SVD at init; per-step K=3 power iteration with drift detection (τ=0.95) triggering recalibration |
-| **Momentum-aligned masking** | §3.3 | `kernels.py:_zo_muon_tall_kernel` L50-54, `_zo_muon_wide_kernel` L139-143 | `mask = sign(grad) == sign(momentum_buf)` — applied to A only, after warmup (10 steps) |
-| **ZO-Muon spectral update** | §5.2 | `kernels.py:zo_muon_update()` | Fused: grad → masking → momentum → Frobenius norm → 5-iter Newton-Schulz → param update. Dispatches tall/wide kernel |
-| **Newton-Schulz orthogonalization** | §5.2 | `kernels.py:_zo_muon_tall_kernel` L74-97 (tall), `_zo_muon_wide_kernel` L161-184 (wide) | Tall: `X = 0.5 * X @ (3I - X^T@X)`. Wide: `X = 0.5 * (3I - X@X^T) @ X`. Inner products are rank×rank (16×16) |
-| **Fused dual perturbation** | §6.1 | `kernels.py:fused_perturb_dual()` | θ+ = base + z, θ- = base - z in one kernel pass (halves memory traffic) |
-| **RLOO advantage computation** | §4.2 | `controller.py:_explore()` L288-293 | `adv_i = r_i - mean(r_j, j≠i)`. Unbiased, minimum-variance, no tunable baseline |
-| **Contrastive scoring** | §4.3 | `controller.py:_score_contrastive()` | Advantage-weighted NLL under θ+ and θ-. Zero-advantage fallback to NLL on best candidate |
-| **Asymmetric gradient regularization** | §4.3a | `controller.py:_score_contrastive()` L228-235 | `λ_GR * Σ(NLL_pos - NLL_neg)²` added to loss_pos only — does not cancel in finite differences |
-| **KL constraint** | §4.3b | `controller.py:_apply_kl_constraint()` | Scales η down when `\|loss_pos - loss_neg\| > δ_KL` — post-hoc filter, not loss penalty |
-| **Adaptive epsilon** | §2.1 | `controller.py:_update_eps()` | `eps = eps_base * max(loss_ema / initial_loss_ema, eps_floor)`. eps_base = 1e-3/√r |
-| **DD clipping** | §2.1 | `controller.py:_clip_dd()` | Clips raw directional derivative at 3× running EMA |
-| **Spike detection** | §4.4 | `controller.py:_check_health()` | Skip update if NLL > 5× EMA. Tracks on loss_neg (unbiased, no GR penalty) |
-| **Cosine LR** | §5.3 | `controller.py:_update_lr()` | η_min = η_max/100, cosine annealing over total_steps |
-| **Cosine temperature annealing** | §7.3 | `controller.py:_update_temperature()` | T_max=1.0 → T_min=0.3, with entropy collapse boost (1.5× if reward_range < 0.5 × initial) |
+| Mechanism | File:Function | Role |
+|:----------|:--------------|:-----|
+| **SPSA gradient estimation** | `controller.py:step()` | `dd = (loss_pos - loss_neg) / (2*eps)` — scalar directional derivative shared across all layers |
+| **AGZO subspace perturbation** | `controller.py:_get_perturbation()` → `kernels.py:fused_agzo_perturbation()` | Projects perturbations into activation subspace (B) and B's column space (A). Reduces effective dims ~8x |
+| **Activation subspace tracking** | `controller.py:_calibrate_activation_bases_full()`, `_update_activation_bases()` → `kernels.py:fused_power_iter()` | Full SVD at init; per-step K=3 warm-started power iteration with cubically convergent refinement |
+| **ZO-Muon spectral update** | `kernels.py:zo_muon_update()` | Fused: grad → momentum → Frobenius normalize → 5-iter Newton-Schulz orthogonalization → param update. Dispatches tall/wide kernel |
+| **Newton-Schulz orthogonalization** | `kernels.py:_zo_muon_tall_kernel`, `_zo_muon_wide_kernel` | Tall: `X = 0.5 * X @ (3I - X.T@X)`. Wide: `X = 0.5 * (3I - X@X.T) @ X`. Inner products are rank×rank (16×16) |
+| **Fused dual perturbation** | `kernels.py:fused_perturb_dual()` | θ+ = base + z, θ- = base - z in one kernel pass (halves memory traffic) |
+| **RLOO advantage computation** | `controller.py:_explore()` | `adv_i = r_i - mean(r_j, j≠i)`. Unbiased, minimum-variance, no tunable baseline. REINFORCE++ normalization by reward std. |
+| **Contrastive scoring** | `controller.py:_score_contrastive()` | Advantage-weighted NLL under θ+ and θ-. Zero-advantage gives dd=0 (no update) |
+| **ZClip** | `controller.py:_zclip()` | Z-score clipping on directional derivative: clips at dd_ema ± 3σ (Chebyshev bound). Adaptive EMA window. |
+| **Cosine LR** | `controller.py:_update_lr()` | Cosine decay to zero (D2Z — CoLLAs 2025) |
+| **Cosine temperature annealing** | `controller.py:_update_temperature()` | T_max → T_min = T_max/num_candidates, plain cosine schedule |
+| **Fixed epsilon** | `controller.py.__init__` | `eps = 1e-3 / sqrt(rank)` (SPSA theory — Spall 1998; FlatZero — preserves flat-minima regularization) |
 
 ### 2.2 Infrastructure (Required — supports core algorithm)
 
@@ -59,7 +55,7 @@ Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x mo
 | **vLLM backend** | `backend.py:VLLMBackend` | Adapter serialization to /dev/shm, generation, prefill scoring, activation hook capture |
 | **Adapter serialization** | `backend.py:_save_peft_adapter()` | FP32→BF16 with PiSSA↔PEFT naming swap (lora_A=B, lora_B=A) |
 | **Activation extraction** | `backend.py:extract_activations()` | Forward hooks via collective_rpc; handles vLLM module merges (qkv_proj, gate_up_proj) |
-| **Checkpointing** | `controller.py:_save_checkpoint()` | FP32 masters + momentum + optimizer state every 100 steps |
+| **Checkpointing** | `controller.py:_save_checkpoint()` | FP32 masters + momentum + activation bases + RNG state via safetensors + JSON |
 | **Training entry** | `scripts/train.py:main()` | YAML config + JSONL prompts → vLLM engine → controller.train() |
 | **Launch script** | `scripts/launch.sh` | GPU clock lock, env vars, PYTHONPATH |
 
@@ -67,8 +63,8 @@ Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x mo
 
 | Component | File:Function | Role |
 |:----------|:--------------|:-----|
-| **SFT step** | `controller.py:_step_sft()` | Random full-rank perturbation + plain SGD (no AGZO, no ZO-Muon, no masking) |
-| **SFT loss** | `controller.py:_compute_loss_sft()` | NLL on completion tokens under θ+ and θ-, with asymmetric GR |
+| **SFT step** | `controller.py:step()` via `hybrid_switch_step` | Same pipeline (AGZO + ZO-Muon) with NLL loss on completions instead of contrastive scoring |
+| **SFT loss** | `controller.py:_compute_loss_sft()` | NLL on completion tokens under θ+ and θ- |
 
 ---
 
@@ -97,15 +93,14 @@ rl_bench_eval.py (online)
   → for step in range(1000):
       controller.step([prompt])
         → _explore(): generate 4 candidates, score with exec_reward, RLOO advantages
-        → extract_activations(): hook-based capture → power iteration update
-        → _get_perturbation(): AGZO subspace perturbation for each layer
+        → extract_activations(): hook-based capture → power iteration update (fused_power_iter)
+        → _get_perturbation(): AGZO subspace perturbation (fused_agzo_perturbation)
         → fused_perturb_dual(): θ+ = base + εz, θ- = base - εz
-        → _sync_adapters(): serialize to /dev/shm
-        → _score_contrastive(): prefill scoring under θ+ and θ-, advantage-weighted NLL + GR
-        → _check_health(): spike detection
-        → _clip_dd(): DD clipping
-        → zo_muon_update(): fused Triton kernel (grad + mask + momentum + N-S + param update)
-        → _update_lr(), _update_eps(), _update_temperature()
+        → sync_adapters(): serialize to /dev/shm
+        → _score_contrastive(): prefill scoring under θ+ and θ-, advantage-weighted NLL
+        → _zclip(): z-score clipping on directional derivative
+        → zo_muon_update(): fused Triton kernel (grad + momentum + N-S + param update)
+        → _update_lr(), _update_temperature()
   → eval_mbpp() — post-training evaluation
 ```
 
@@ -117,13 +112,20 @@ rl_bench_eval.py (online)
 
 **Data:** GSM8K train split via `datasets.load_dataset("openai/gsm8k", "main", split="train")`
 
-**Execution path:** Same as RL except: random perturbation (not AGZO), plain SGD (not ZO-Muon), NLL loss on completions (not contrastive scoring).
+**Execution path:** Same pipeline (AGZO perturbation, ZO-Muon update) but with NLL loss on completions instead of contrastive RL scoring. No generation/exploration step.
 
 ### 3.3 Component Ablations
 
 **Entry:** `eval/ablations.py`
 
-**Experiments (8):** control, no_zomuon, no_agzo, no_masking, no_gr, no_kl, static_bases, fixed_eps. Each runs 200 steps with monkey-patched controller. Measures: score, loss_ema, dd_ema, memory, time.
+**Experiments (4):** control, no_zomuon, no_agzo, static_bases. Each runs 200 steps with monkey-patched controller. Measures: pass@1, dd_ema, memory, time.
+
+| Experiment | Ablation | Method |
+|:-----------|:---------|:-------|
+| `control` | None (full system) | Baseline |
+| `no_zomuon` | Replace ZO-Muon with SGD+momentum | Monkey-patches `step()` to skip `zo_muon_update` kernel |
+| `no_agzo` | Replace AGZO with random perturbation | Monkey-patches `_get_perturbation()` to skip `fused_agzo_perturbation` kernel |
+| `static_bases` | Freeze activation bases at init | Monkey-patches `_update_activation_bases()` to no-op (skips `fused_power_iter` kernel) |
 
 ---
 
@@ -136,14 +138,12 @@ All metrics use standard libraries. No custom metric implementations.
 | MBPP pass@1 | `evaluate.load("code_eval")` | `code_eval.compute(references, predictions)` | `eval/benchmarks.py:eval_mbpp()` |
 | HumanEval pass@1 | `evaluate.load("code_eval")` | `code_eval.compute(references, predictions)` | `eval/benchmarks.py:eval_humaneval()` |
 | GSM8K exact match | `evaluate.load("exact_match")` | `exact_match.compute(predictions, references)` | `eval/benchmarks.py:eval_gsm8k()` |
-| MMLU accuracy | `evaluate.load("accuracy")` | `accuracy.compute(predictions, references)` | `eval/benchmarks.py:eval_mmlu()` |
 | Perplexity | `math.exp(avg_nll)` | Direct NLL via vLLM prefill logprobs | `eval/benchmarks.py:eval_perplexity()` |
 
 **Mathematical definitions:**
 - **pass@1:** Fraction of problems where at least one generated solution passes all test assertions. Computed by `evaluate.code_eval` with sandboxed execution.
 - **Exact match:** Binary string equality between extracted numerical answer and ground truth, after stripping commas.
 - **Perplexity:** `exp(-(1/T) Σ_t log p(y_t | y_{<t}))` where T = number of completion tokens. NLL extracted via vLLM `prompt_logprobs`.
-- **MMLU accuracy:** Fraction of questions where `argmax_c log p(c | prompt)` over c ∈ {A,B,C,D} matches ground truth.
 
 ---
 
@@ -151,8 +151,8 @@ All metrics use standard libraries. No custom metric implementations.
 
 ### 5.1 Deterministic Execution
 
-- [x] Single execution path per mode (RL or SFT). No fallback logic, no "if missing then skip."
-- [x] GPU always available. No CPU fallbacks, no `torch.cuda.is_available()` checks.
+- [x] Single execution path per mode (RL or SFT). No fallback logic.
+- [x] GPU always available. No CPU fallbacks.
 - [x] All dependencies pinned in `pyproject.toml`. No conditional imports.
 - [x] First failure = immediate crash with traceback. No silent degradation.
 
@@ -173,64 +173,48 @@ All metrics use standard libraries. No custom metric implementations.
 
 ---
 
-## 6. Spec-vs-Implementation Discrepancy Log
+## 6. Spec-vs-Implementation Notes
 
-Discrepancies identified during forensic analysis (source: `eval/analysis_results.md` claim verification, `DS_MeZO_Combined.md` cross-reference, and code audit).
+### 6.1 DS_MeZO_Combined.md Divergences
 
-### 6.1 Discrepancies That Undermine Stated Claims
+`DS_MeZO_Combined.md` remains as detailed design rationale. The following areas diverge from the actual implementation:
 
-| # | Spec Claim | Implementation Reality | Impact |
-|:--|:-----------|:----------------------|:-------|
-| D1 | §9: Controller state ~0.22 GB | Measured: ~0.63 GB (2.6× over budget) | Memory budget table inaccurate. "Near-inference" claim still holds (0.8% overhead) but specific numbers mislead. |
-| D2 | §6.1: 5 fused Triton kernels (subspace_perturb, zo_muon_update, spsa_gradient, score_reduce, health_monitor) | Only 2 implemented: `zo_muon_update`, `fused_perturb_dual`. Other ops are Python. | Spec overstates kernel coverage. Functionally equivalent but not "entirely in Triton" as §1 claims. |
-| D3 | §2 SPSA formula: `ĝ = ((L⁺-L⁻)/2ε) · z` | Implementation uses eps-scaled z: `dd * z_scaled` where `z_scaled = eps * z_raw`. Epsilon cancels in effective gradient: `((L⁺-L⁻)/2) · z_raw`. | Adaptive epsilon controls perturbation magnitude only, not gradient magnitude. Formula in §2 is misleading about what epsilon actually scales. Internally consistent with §8 pseudocode. |
-| D4 | §3.2 A perturbation formula includes sparse mask M_l: `z_A = Z_coeff' · Q^T ⊙ M_l` | Masking is not applied during perturbation — it's applied at update step inside the Triton kernel. | Spec formula is wrong about where masking occurs. Implementation is correct (masking at perturbation time is meaningless since z_A is random). Noted as "Bug 2 fix" in controller docstring. |
-| D5 | §3.4 claims ~50% sparsity from momentum-aligned masking (vs 20% for magnitude masking) | Not empirically verified in codebase. | Analytical projection, not measured. |
+| # | Area | DS_MeZO_Combined.md | Implementation |
+|:--|:-----|:--------------------|:---------------|
+| 1 | Memory budget | §9: Controller state ~0.22 GB | Measured: ~0.63 GB. "Near-inference" claim still holds (0.8% overhead). |
+| 2 | Kernel count | §6.1: 5 fused Triton kernels | 4 implemented: zo_muon_update, fused_power_iter, fused_agzo_perturbation, fused_perturb_dual |
+| 3 | CUDA graphs | §6.2.4: `enforce_eager=False` | `enforce_eager=True` — required for Python forward hooks |
+| 4 | Prefill count | §7.2: "7 total prefills per step" | 1 generation + 1 activation extraction + 4 scoring = 6 prefills + 1 generation |
 
-### 6.2 Discrepancies That Are Neutral or Strengthen
+### 6.2 Paper Adaptations
 
-| # | Spec Claim | Implementation Reality | Impact |
-|:--|:-----------|:----------------------|:-------|
-| D6 | §6.2.4: `enforce_eager=False` for CUDA graphs | Implementation: `enforce_eager=True` | Necessary — Python forward hooks for activation extraction don't fire under CUDA graphs. Correct engineering decision. |
-| D7 | §8 pseudocode: `_score_contrastive` uses `max(len(logprobs), 1)` for NLL denominator | Implementation uses `len(logprobs)` directly | Simplification — logprobs list is never empty in practice (requires completion tokens to exist). |
-| D8 | §8 pseudocode: separate `_zo_muon_update()` Python function with `torch.compile` | Implementation: fused Triton kernel `zo_muon_update()` | Upgrade — Triton kernel is faster and avoids `torch.compile` graph capture overhead. |
-| D9 | §8 pseudocode: `_check_health` uses `avg_nll = (abs(loss_pos) + abs(loss_neg)) / 2` | Implementation uses `avg_nll = abs(loss_neg)` only | Improvement — loss_neg is unbiased (no GR penalty), better EMA signal. |
-| D10 | §7.2: "7 total prefills per step" | Actual: 1 generation + 1 activation extraction + 4 scoring = 6 prefills + 1 generation | Terminology imprecise. Generation ≠ prefill. |
+DS-MeZO adapts insights from cited papers into a unified ZO framework:
 
-### 6.3 Spec Features Not Implemented (documented, not bugs)
+| Paper | DS-MeZO Adaptation | Deviation |
+|:------|:-------------------|:----------|
+| **AGZO** (2601.17261) | Activation subspace perturbation | Uses symmetric two-point SPSA (lower variance than paper's one-point estimator). r_calib = rank/2 (paper uses r=1). |
+| **ZO-Muon** (2602.17155) | Newton-Schulz orthogonalization on momentum buffers | Uses standard 2-term N-S `X = 0.5·X(3I - XᵀX)` (paper uses optimized 3-term variant). Substitutes AGZO subspace for ZO-Muon's random projection. |
 
-| # | Feature | Spec Section | Status |
-|:--|:--------|:-------------|:-------|
-| N1 | Pinned memory for adapter transfer | §6.2.5 | Not implemented. Low priority — tmpfs already eliminates I/O bottleneck. |
-| N2 | `torch.compile` for controller kernels | §6.2.7 | Superseded by Triton kernels. |
-| N3 | NF4 quantization of W_res | §3.1 | Not implemented — residual model stored in original dtype (BF16). Would reduce VRAM by ~50% for the base model. |
-| N4 | K-sample SPSA averaging | §13 | Future extension. |
-| N5 | CUDA graph capture for scoring | §6.2.4 | Incompatible with activation hooks. |
+### 6.3 Spec Features Not Implemented
 
-### 6.4 Paper-vs-Implementation Comparison
-
-Cross-reference of DS-MeZO's implementation against the four cited source papers. Each mechanism is an adaptation, not a direct reimplementation.
-
-| Paper | Cited As | DS-MeZO Adaptation | Deviation | Impact |
-|:------|:---------|:-------------------|:----------|:-------|
-| **AGZO** (2601.17261) | §3.2 subspace perturbation | Paper uses one-point estimator `(f⁺ - f₀)/μ` with r=1 subspace. DS-MeZO uses symmetric two-point SPSA `(f⁺ - f⁻)/2ε` with r_calib=8. Subspace extraction (power iteration on activations → QR) matches. | **Strengthens** — two-point SPSA has lower variance than one-point. Higher r_calib captures more activation subspace structure. |
-| **ZO-Muon** (2602.17155) | §5 spectral optimizer | Paper uses a separate random projection matrix P (resampled every 100 steps), N_q=4 perturbation queries per step, and a 3-term N-S recurrence with coefficients (3.4445, -2.8025, 0.8558). DS-MeZO applies standard 2-term N-S `X = 0.5·X(3I - XᵀX)` directly to AGZO-restricted momentum buffers — no separate projection matrix P, no multi-query perturbation. | **Significant divergence** — DS-MeZO uses N-S orthogonalization from ZO-Muon but substitutes AGZO's subspace for ZO-Muon's random projection. The N-S recurrence is the simpler standard form, not the paper's optimized 3-term variant. Empirically validated via ablation (no_zomuon: -48.8). |
-| **Magma** (2602.15322) | §3.3 momentum-aligned masking | Paper operates at block granularity with sigmoid-scaled alignment `s = sigmoid(cos_sim(μ, g)/τ)`, EMA-damped scaling (β=0.9), and Bernoulli skip masks. DS-MeZO simplifies to element-wise binary masking `sign(grad) == sign(momentum_buf)` on A matrices only, no sigmoid, no temperature, no scaling EMA. | **Simplified adaptation** — captures the core insight (mask by gradient-momentum agreement) but discards block-level granularity and continuous scaling. Empirically validated via ablation (no_masking: -126.2). |
-| **Gradient Reg.** (2602.18037) | §4.3a reward gradient penalty | Paper is a first-order method: penalizes `‖∇_ϕ J‖²` via finite-difference Hessian-vector products requiring 2 backward passes. DS-MeZO creates a ZO-native analog: `λ_GR · Σ(NLL_pos - NLL_neg)²` — the NLL divergence between perturbation directions, added asymmetrically to loss_pos only. No backward passes, no Hessian approximation. | **Different mechanism** — shares the motivation (penalize rapid reward changes to prevent hacking) but the formula is a ZO-specific construction, not the paper's first-order method. Asymmetric application ensures non-cancellation in SPSA finite differences. Empirically validated (no_gr: -205.8, second-largest ablation delta). |
-
-**Summary:** DS-MeZO does not directly reimplement any of these papers. It adapts their core insights into a unified ZO framework: AGZO's activation subspace perturbation, ZO-Muon's spectral orthogonalization (simplified N-S form), Magma's momentum-alignment concept (simplified to binary masking), and gradient regularization's sharpness penalty (reformulated for ZO). All adaptations are empirically validated through ablation experiments showing positive contribution.
+| Feature | DS_MeZO_Combined.md | Status |
+|:--------|:---------------------|:-------|
+| Pinned memory for adapter transfer | §6.2.5 | Not implemented. Low priority — tmpfs eliminates I/O bottleneck. |
+| NF4 quantization of W_res | §3.1 | Not implemented — residual model stored in BF16. |
+| CUDA graph capture for scoring | §6.2.4 | Incompatible with activation hooks. |
 
 ---
 
-## 7. What Must Stay vs What Is Noise
+## 7. Repository Structure
 
-### Must Stay (maps to §1-§5 mechanisms or §3.1-§3.3 execution paths)
+### Must Stay (maps to §2 mechanisms or §3 execution paths)
 
 ```
 ds_mezo/
-  controller.py     — Core algorithm: SPSA, AGZO, RLOO, ZO-Muon, all schedules
+  controller.py     — Core algorithm: SPSA, AGZO, RLOO, ZO-Muon, ZClip, schedules
   backend.py         — vLLM isolation: adapter serialization, scoring, activation hooks
-  kernels.py         — Fused Triton kernels: zo_muon_update, fused_perturb_dual
+  kernels.py         — Four fused Triton kernels: zo_muon_update, fused_power_iter,
+                       fused_agzo_perturbation, fused_perturb_dual
   model_config.py    — Layer discovery via meta-device introspection
   __init__.py
 
@@ -241,14 +225,11 @@ scripts/
 
 eval/
   __init__.py        — Package marker
-  utils.py           — Shared utilities (extract_code)
+  utils.py           — Shared utilities (extract_code, pass_at_k, make_exec_reward)
   benchmarks.py      — Standard benchmark implementations (all use `evaluate` library)
   rl_bench_eval.py   — Primary RL proof-of-concept (MBPP, execution-based reward)
-  sft_eval.py        — Secondary SFT evaluation (GSM8K)
-  ablations.py       — Component ablation experiments (8 controlled experiments)
-
-tests/
-  test_evaluation.py — Mathematical property verification of kernel/algorithm correctness
+  sft_eval.py        — SFT evaluation (GSM8K)
+  ablations.py       — Component ablation experiments (4 controlled experiments)
 
 configs/
   smoke.yaml         — Minimal smoke test config
@@ -256,16 +237,6 @@ configs/
 pyproject.toml       — Dependency manifest
 ```
 
-### Deleted (cleanup complete)
-
-The following files were removed — none mapped to any objective:
-
-- `eval/run.py` — Superseded by `rl_bench_eval.py`
-- `eval/debug_hooks.py` — Development artifact
-- `eval/results.json`, `eval/rl_bench_results.json`, `eval/sft_results.json` — Output artifacts (now gitignored)
-- `eval/analysis_results.md` — Audit report, content distilled into §6
-- `DS_MeZO_Parameter_Audit.md` — Superseded pre-v2 parameter audit
-
 ### Retained Documentation
 
-`DS_MeZO_Combined.md` remains as detailed design rationale. Its implementation-specific claims (kernel count, memory budget, CUDA graph usage, pseudocode) are known to diverge from the actual implementation (see §6). `objectives.md` (this file) is the authoritative reference for what the code actually does.
+`DS_MeZO_Combined.md` remains as detailed design rationale. Its implementation-specific claims diverge from the actual implementation (see §6). `objectives.md` (this file) is the authoritative reference for what the code actually does.

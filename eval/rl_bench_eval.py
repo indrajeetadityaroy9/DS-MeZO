@@ -20,7 +20,7 @@ from ds_mezo.model_config import discover_layers
 from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
 from eval.benchmarks import eval_mbpp, load_mbpp_train
-from eval.utils import ExecReward
+from eval.utils import make_exec_reward
 
 
 def main() -> None:
@@ -67,7 +67,7 @@ def main() -> None:
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
     # Init controller
-    reward = ExecReward()
+    reward, set_problem = make_exec_reward()
     layer_specs = discover_layers(args.model_path, target_modules)
     backend = VLLMBackend(llm, layer_specs, rank)
     controller = DSMeZO_Controller(backend, layer_specs, {
@@ -95,7 +95,7 @@ def main() -> None:
     log = []
     for step_idx in range(total_steps):
         problem = train_data[step_idx % len(train_data)]
-        reward.set_problem(problem["test_list"], problem["test_imports"])
+        set_problem(problem["test_list"], problem["test_imports"])
         controller.step([problem["prompt"]])
 
         log.append({

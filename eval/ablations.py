@@ -25,8 +25,7 @@ from vllm import LLM
 from ds_mezo.model_config import LayerSpec, discover_layers
 from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller, LayerState
-from ds_mezo.kernels import fused_perturb_dual
-from eval.utils import ExecReward
+from eval.utils import make_exec_reward
 from eval.benchmarks import eval_mbpp, load_mbpp_train
 
 TOTAL_STEPS = 200
@@ -36,7 +35,7 @@ def run_experiment(
     llm: Any,
     layer_specs: list[LayerSpec],
     name: str,
-    patch_fn: Callable[[DSMeZO_Controller], None] | None,
+    patch_fn: Callable[[DSMeZO_Controller], None],
     adapter_path: Path,
     output_dir: Path,
     train_data: list[dict[str, Any]],
@@ -47,7 +46,7 @@ def run_experiment(
     experiment_dir = output_dir / name
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    reward = ExecReward()
+    reward, set_problem = make_exec_reward()
     config = {
         "output_dir": str(experiment_dir),
         "adapter_path": str(adapter_path),
@@ -66,14 +65,12 @@ def run_experiment(
     mem_after_init = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
 
     controller._calibrate_activation_bases_full([train_data[0]["prompt"]])
-
-    if patch_fn:
-        patch_fn(controller)
+    patch_fn(controller)
 
     t0 = time.time()
     for step_idx in range(TOTAL_STEPS):
         problem = train_data[step_idx % len(train_data)]
-        reward.set_problem(problem["test_list"], problem["test_imports"])
+        set_problem(problem["test_list"], problem["test_imports"])
         controller.step([problem["prompt"]])
         if (step_idx + 1) % 50 == 0:
             print(f"    [{name}] step {step_idx+1}/{TOTAL_STEPS} "
@@ -123,10 +120,10 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
         neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            pos_A, neg_A = torch.empty_like(layer.A), torch.empty_like(layer.A)
-            pos_B, neg_B = torch.empty_like(layer.B), torch.empty_like(layer.B)
-            fused_perturb_dual(layer.A, z_A, pos_A, neg_A)
-            fused_perturb_dual(layer.B, z_B, pos_B, neg_B)
+            pos_A = layer.A + z_A
+            neg_A = layer.A - z_A
+            pos_B = layer.B + z_B
+            neg_B = layer.B - z_B
             pos_layers[layer.key] = (pos_A, pos_B)
             neg_layers[layer.key] = (neg_A, neg_B)
 
@@ -189,8 +186,12 @@ def patch_static_bases(controller: DSMeZO_Controller) -> None:
 
 # ── Experiment definitions ──────────────────────────────────────────────────
 
+def _noop(controller: DSMeZO_Controller) -> None:
+    """No-op patch for control experiment."""
+
+
 EXPERIMENTS: list[dict[str, Any]] = [
-    {"name": "control",       "patch": None},
+    {"name": "control",       "patch": _noop},
     {"name": "no_zomuon",     "patch": patch_sgd_momentum},
     {"name": "no_agzo",       "patch": patch_random_perturbation},
     {"name": "static_bases",  "patch": patch_static_bases},

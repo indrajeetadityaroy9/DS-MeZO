@@ -6,7 +6,7 @@ Environment variables (VLLM_ALLOW_INSECURE_SERIALIZATION, etc.) must be set
 by the caller — see scripts/launch.sh.
 
 Config YAML requires: model_path, adapter_path, output_dir.
-All other hyperparameters use spec defaults from DSMeZOConfig.
+All other hyperparameters use spec defaults from _CONFIG_DEFAULTS.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from vllm import LLM
 
 from ds_mezo.model_config import discover_layers
 from ds_mezo.backend import VLLMBackend
-from ds_mezo.controller import DSMeZO_Controller
+from ds_mezo.controller import DSMeZO_Controller, _CONFIG_DEFAULTS
 
 
 def main() -> None:
@@ -51,9 +51,10 @@ def main() -> None:
     )
 
     layer_specs = discover_layers(config["model_path"], target_modules)
-    staging_dir = config.get("staging_dir", "/dev/shm/ds_mezo")
+    staging_dir = config.get("staging_dir", _CONFIG_DEFAULTS["staging_dir"])
     backend = VLLMBackend(llm, layer_specs, rank, staging_dir=staging_dir)
     controller = DSMeZO_Controller(backend, layer_specs, config)
+    controller._calibrate_activation_bases_full([prompts[0]])
     controller.train(prompts)
 
 
