@@ -52,7 +52,7 @@ Tensor conventions:
   - All inputs: FP32, 2D, contiguous, CUDA.
   - Adapter rank >= 16 (tl.dot contraction minimum).
   - zo_muon_update: param, buf, z, scratch — identical shape.
-  - fused_power_iter: H (T, D), V (D, R). D and R are constexpr.
+  - fused_power_iter: H (T, D), V (D, R). D and R padded to next power of 2 internally.
   - fused_agzo_perturbation: B (R, d_in), V (d_in, RC), z_coeff_B (R, RC),
     z_coeff_A (d_out, RC). R and RC are constexpr.
   - fused_perturb_dual: base, z, pos, neg — identical shape.
@@ -261,11 +261,13 @@ def zo_muon_update(
 # ── Kernel 2: Fused power iteration ───────────────────────────────────────
 # Replaces Python loop: for _ in range(iters): V = H.T @ (H @ V); V, _ = qr(V)
 # Fuses H.T @ H @ V matmul chain + modified Gram-Schmidt QR into one kernel.
+# Handles arbitrary D and R via pad-to-next-power-of-2 with masking.
 
 @triton.jit
 def _power_iter_kernel(
     H_ptr, V_ptr, out_ptr,
-    T, D: tl.constexpr, R: tl.constexpr,
+    T, D_actual, R_actual,
+    D: tl.constexpr, R: tl.constexpr,
     stride_ht, stride_hd,
     stride_vd, stride_vr,
     stride_od, stride_or,
@@ -274,16 +276,21 @@ def _power_iter_kernel(
 ):
     """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
 
-    H: (T, D) activation matrix, V: (D, R) basis to refine, out: (D, R) result.
-    Tiles along T (token dimension). D and R held in registers.
-    Modified Gram-Schmidt QR in registers — exact for R ≤ 64.
+    H: (T, D_actual) activation matrix, V: (D_actual, R_actual) basis to refine.
+    D and R are padded to next power of 2 for register allocation; D_actual and
+    R_actual mask loads/stores to the actual tensor dimensions.
+    Tiles along T (token dimension). Modified Gram-Schmidt QR in registers.
     """
     offs_d = tl.arange(0, D)
     offs_r = tl.arange(0, R)
+    d_mask = offs_d < D_actual
+    r_mask = offs_r < R_actual
     num_chunks = tl.cdiv(T, BLOCK_T)
 
     V = tl.load(
         V_ptr + offs_d[:, None] * stride_vd + offs_r[None, :] * stride_vr,
+        mask=d_mask[:, None] & r_mask[None, :],
+        other=0.0,
     )
 
     for _it in tl.static_range(num_iters):
@@ -296,7 +303,7 @@ def _power_iter_kernel(
 
             H_tile = tl.load(
                 H_ptr + offs_t[:, None] * stride_ht + offs_d[None, :] * stride_hd,
-                mask=t_mask, other=0.0,
+                mask=t_mask & d_mask[None, :], other=0.0,
             )
             HV_tile = tl.dot(H_tile, V, allow_tf32=False)
             HtHV += tl.dot(tl.trans(H_tile), HV_tile, allow_tf32=False)
@@ -319,6 +326,7 @@ def _power_iter_kernel(
     tl.store(
         out_ptr + offs_d[:, None] * stride_od + offs_r[None, :] * stride_or,
         V,
+        mask=d_mask[:, None] & r_mask[None, :],
     )
 
 
@@ -329,35 +337,24 @@ def fused_power_iter(
 ) -> torch.Tensor:
     """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
 
-    Uses Triton kernel when D and R are powers of 2 and fit in shared memory.
-    Falls back to PyTorch matmul + QR otherwise (e.g. D=1536 for Qwen2).
+    Handles arbitrary D and R via pad-to-next-power-of-2 with masking.
     H: (T, D), V: (D, R).
     """
     T, D = H.shape
     _, R = V.shape
 
-    d_is_po2 = (D & (D - 1)) == 0
-    r_is_po2 = (R & (R - 1)) == 0
-
-    if d_is_po2 and r_is_po2:
-        out = torch.empty(D, R, device="cuda", dtype=torch.float32)
-        _power_iter_kernel[(1,)](
-            H, V, out,
-            T, D=D, R=R,
-            stride_ht=H.stride(0), stride_hd=H.stride(1),
-            stride_vd=V.stride(0), stride_vr=V.stride(1),
-            stride_od=out.stride(0), stride_or=out.stride(1),
-            num_iters=num_iters,
-            BLOCK_T=128,
-        )
-        return out
-
-    # PyTorch fallback for non-power-of-2 dimensions
-    for _ in range(num_iters):
-        HV = H @ V
-        V = H.T @ HV
-        V, _ = torch.linalg.qr(V)
-    return V
+    out = torch.empty(D, R, device="cuda", dtype=torch.float32)
+    _power_iter_kernel[(1,)](
+        H, V, out,
+        T, D_actual=D, R_actual=R,
+        D=triton.next_power_of_2(D), R=triton.next_power_of_2(R),
+        stride_ht=H.stride(0), stride_hd=H.stride(1),
+        stride_vd=V.stride(0), stride_vr=V.stride(1),
+        stride_od=out.stride(0), stride_or=out.stride(1),
+        num_iters=num_iters,
+        BLOCK_T=128,
+    )
+    return out
 
 
 # ── Kernel 3: Fused AGZO perturbation ─────────────────────────────────────

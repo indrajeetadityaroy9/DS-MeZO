@@ -27,6 +27,7 @@ def find_safetensor_files(model_path: Path) -> list[Path]:
     return sorted(model_path.glob("*.safetensors"))
 
 
+@torch.compile
 def decompose(
     W0: torch.Tensor, rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

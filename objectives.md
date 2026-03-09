@@ -6,13 +6,15 @@ This file is the single source of truth for determining what belongs in this rep
 
 ## 1. Core Research Problem
 
-**Can zeroth-order (gradient-free) optimization fine-tune large language models on non-differentiable reward signals using a single GPU, at near-inference memory cost?**
+**Can zeroth-order (gradient-free) optimization perform RL post-training of large language models on non-differentiable reward signals using a single GPU, at near-inference memory cost?**
 
 Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x model memory for gradients, optimizer states, and activations — demanding multi-GPU clusters. DS-MeZO replaces backpropagation with SPSA gradient estimation on PiSSA (LoRA-compatible) adapters, using forward passes only. The optimizer estimates gradients via symmetric two-point finite differences, operating entirely in the adapter's low-rank subspace.
 
+**Distinction: post-training vs fine-tuning.** SFT fine-tuning minimizes a differentiable loss (NLL) where backprop-based LoRA already works cheaply. The value proposition of DS-MeZO is RL post-training: optimizing non-differentiable reward signals (code execution, proof verification) where backprop requires either differentiable reward approximations or multi-GPU policy gradient pipelines. DS-MeZO includes an SFT mode as a secondary baseline, but the primary contribution targets RL.
+
 **Claimed contributions:**
 
-1. A complete ZO-RL training pipeline (AGZO + ZO-Muon + RLOO) that runs on a single H100 with ~0.8% memory overhead beyond inference
+1. A parameter-free ZO-RL post-training pipeline (AGZO + ZO-Muon + RLOO) that runs on a single H100 with ~0.8% memory overhead beyond inference. All optimizer hyperparameters (LR, momentum, temperature) are self-derived — no manual tuning.
 2. Activation-guided subspace perturbation (AGZO) reducing effective ZO dimensionality by ~8x
 3. Four fused Triton kernels: ZO-Muon spectral update, power iteration, AGZO perturbation, dual perturbation
 4. Empirical validation: Llama-3.1-8B MBPP pass@1 improvement via execution-based RL reward, no backpropagation
@@ -41,9 +43,10 @@ Backpropagation-based RL post-training (PPO, GRPO, DeepSeek-R1) requires 2-4x mo
 | **Fused dual perturbation** | `kernels.py:fused_perturb_dual()` | θ+ = base + z, θ- = base - z in one kernel pass (halves memory traffic) |
 | **RLOO advantage computation** | `controller.py:_explore()` | `adv_i = r_i - mean(r_j, j≠i)`. Unbiased, minimum-variance, no tunable baseline. REINFORCE++ normalization by reward std. |
 | **Contrastive scoring** | `controller.py:_score_contrastive()` | Advantage-weighted NLL under θ+ and θ-. Zero-advantage gives dd=0 (no update) |
-| **ZClip** | `controller.py:_zclip()` | Z-score clipping on directional derivative: clips at dd_ema ± 3σ (Chebyshev bound). Adaptive EMA window. |
-| **Cosine LR** | `controller.py:_update_lr()` | Cosine decay to zero (D2Z — CoLLAs 2025) |
-| **Cosine temperature annealing** | `controller.py:_update_temperature()` | T_max → T_min = T_max/num_candidates, plain cosine schedule |
+| **ZClip** | `controller.py:_zclip()` | Reciprocal z-score clipping on directional derivative (z_thres=2.5, z*=z_thres²/z). Adaptive EMA window (VA-Muon). |
+| **Self-calibrating LR** | `controller.py:_update_lr()` | `eps/dd_ema * cosine` — Spall 1998 §7: optimal a ~ c². Scale-invariant, parameter-free. |
+| **Self-adaptive momentum** | `controller.py:step()` | `1 - _ema_alpha()` — VA-Muon complement. Ramps from 0 (responsive) to 1-1/√T (stable). |
+| **Cosine temperature decay** | `controller.py:_update_temperature()` | 1.0 (softmax identity) → 0.0 (greedy) via cosine |
 | **Fixed epsilon** | `controller.py.__init__` | `eps = 1e-3 / sqrt(rank)` (SPSA theory — Spall 1998; FlatZero — preserves flat-minima regularization) |
 
 ### 2.2 Infrastructure (Required — supports core algorithm)
@@ -126,6 +129,16 @@ rl_bench_eval.py (online)
 | `no_zomuon` | Replace ZO-Muon with SGD+momentum | Monkey-patches `step()` to skip `zo_muon_update` kernel |
 | `no_agzo` | Replace AGZO with random perturbation | Monkey-patches `_get_perturbation()` to skip `fused_agzo_perturbation` kernel |
 | `static_bases` | Freeze activation bases at init | Monkey-patches `_update_activation_bases()` to no-op (skips `fused_power_iter` kernel) |
+
+### 3.4 Comparative Evaluation (GRPO Baseline)
+
+**Entry:** `eval/grpo_baseline.py`
+
+**Baseline:** TRL GRPOTrainer with vLLM colocate mode + PiSSA init. Same adapter initialization as DS-MeZO; isolates the optimizer (backprop vs ZO).
+
+**Comparison axes:** pass@1 (MBPP), peak VRAM (nvidia-smi), throughput (s/step).
+
+**Dependencies:** `pip install -e ".[baselines]"` (trl, peft, accelerate — not required for core DS-MeZO)
 
 ---
 
@@ -230,6 +243,7 @@ eval/
   rl_bench_eval.py   — Primary RL proof-of-concept (MBPP, execution-based reward)
   sft_eval.py        — SFT evaluation (GSM8K)
   ablations.py       — Component ablation experiments (4 controlled experiments)
+  grpo_baseline.py   — GRPO backprop baseline via TRL (comparative evaluation)
 
 configs/
   smoke.yaml         — Minimal smoke test config

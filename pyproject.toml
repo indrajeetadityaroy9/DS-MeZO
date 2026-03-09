@@ -17,6 +17,13 @@ dependencies = [
     "PyYAML==6.0.1",
 ]
 
+[project.optional-dependencies]
+baselines = [
+    "trl>=0.16.0",
+    "peft>=0.15.0",
+    "accelerate>=1.5.0",
+]
+
 [project.scripts]
 ds-mezo-train = "scripts.train:main"
 ds-mezo-pissa = "scripts.prepare_pissa:main"

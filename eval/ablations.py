@@ -139,12 +139,13 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
             key_B = (layer.key, "B")
 
             # SGD+momentum (no Newton-Schulz)
+            mom = 1.0 - self._ema_alpha()
             grad_A = dd * z_A
-            self.momentum_buffers[key_A].mul_(self.momentum).add_((1 - self.momentum) * grad_A)
+            self.momentum_buffers[key_A].mul_(mom).add_((1 - mom) * grad_A)
             layer.A.sub_(self.eta * self.momentum_buffers[key_A])
 
             grad_B = dd * z_B
-            self.momentum_buffers[key_B].mul_(self.momentum).add_((1 - self.momentum) * grad_B)
+            self.momentum_buffers[key_B].mul_(mom).add_((1 - mom) * grad_B)
             layer.B.sub_(self.eta * self.momentum_buffers[key_B])
 
         self._update_lr()

@@ -25,6 +25,9 @@ bash scripts/launch.sh <config.yaml> <prompts.jsonl>
 python -m eval.rl_bench_eval --model-path <path> --adapter-path <path> --output-dir <path>
 python -m eval.sft_eval --model-path <path> --adapter-path <path> --output-dir <path>
 python -m eval.ablations --model-path <path> --adapter-path <path> --output-dir <path>
+
+# GRPO baseline (requires: pip install -e ".[baselines]")
+python -m eval.grpo_baseline --model-path <path> --adapter-path <path> --output-dir <path>
 ```
 
 Entry points are also available via `pyproject.toml`: `ds-mezo-train` (→ `scripts.train:main`) and `ds-mezo-pissa` (→ `scripts.prepare_pissa:main`).
@@ -64,6 +67,7 @@ Controller (controller.py)          Backend (backend.py)
 - **`rl_bench_eval.py`** — RL proof-of-concept on MBPP: trains then evaluates.
 - **`sft_eval.py`** — SFT evaluation on GSM8K with perplexity metric.
 - **`ablations.py`** — 4 controlled component ablation experiments via `run_experiment()`.
+- **`grpo_baseline.py`** — GRPO backprop baseline via TRL GRPOTrainer. Same PiSSA init as DS-MeZO for controlled comparison. Requires `pip install -e ".[baselines]"`.
 
 ### Key conventions
 
@@ -75,21 +79,22 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Config fields (config YAML surface)
 
-Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"output"` but should always be set explicitly). Key optional fields with defaults:
+Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"output"` but should always be set explicitly). Optional fields with defaults:
 
 | Field | Default | Purpose |
 |:---|:---|:---|
 | `total_steps` | 1000 | Training budget |
 | `hybrid_switch_step` | 0 | Step to switch from SFT to RL (0 = RL only) |
-| `eta_max` | 1e-4 | Peak learning rate (cosine schedule) |
-| `momentum` | 0.9 | Momentum coefficient |
-| `num_candidates` | 4 | RLOO candidate count per step |
-| `T_max` | 1.0 | Max sampling temperature |
 | `staging_dir` | `/dev/shm/ds_mezo` | Tmpfs path for adapter hot-swap |
 | `seed` | 42 | RNG seed for reproducibility |
 | `score_fn` | None | Custom reward callable (code sets this programmatically) |
 
-Epsilon is derived from adapter rank. DD clipping uses adaptive EMA variance tracking. See `_CONFIG_DEFAULTS` comment in `controller.py`.
+Self-adaptive parameters (not configurable):
+- **LR**: Self-calibrating `eps/dd_ema * cosine` (Spall 1998 §7: optimal a ~ c²). Scale-invariant.
+- **Momentum**: Self-adaptive `1 - _ema_alpha()` (VA-Muon complement). Ramps from 0 to 1-1/√total_steps.
+- **num_candidates**: 4 (RLOO canonical — Ahmadian et al. 2024). Protocol constant.
+- **Temperature**: Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
+- **Epsilon**: `1e-3/√rank` (SPSA theory — Spall 1998). Derived from adapter rank.
 
 ### Training flow
 
@@ -102,9 +107,9 @@ Epsilon is derived from adapter rank. DD clipping uses adaptive EMA variance tra
 3. **AGZO perturbation**: Project random vectors into activation subspace for B; into B's column space for A
 4. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
 5. **Contrastive scoring**: Score winner/loser trajectories under θ+ and θ-
-6. **ZClip**: Z-score clipping on directional derivative (3σ from tracked variance)
-7. **ZO-Muon update**: Fused kernel applies SPSA gradient → momentum accumulation → Newton-Schulz orthogonalization → parameter update
-8. **Schedule**: Cosine LR, cosine temperature annealing
+6. **ZClip**: Reciprocal z-score clipping on directional derivative (z_thres=2.5, z*=z_thres²/z per 2504.02507 Algorithm 1)
+7. **ZO-Muon update**: Fused kernel applies SPSA gradient → self-adaptive momentum (1-α) → Newton-Schulz orthogonalization → parameter update
+8. **Schedule**: Self-calibrating LR (eps/dd_ema * cosine), cosine temperature decay to 0
 
 ## Environment
 

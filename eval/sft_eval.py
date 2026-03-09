@@ -118,7 +118,6 @@ def main() -> None:
         "model_path": str(args.model_path),
         "total_steps": args.total_steps,
         "hybrid_switch_step": args.total_steps,  # Pure SFT: never switch to RL
-        "eta_max": 1e-2,
     })
     controller._calibrate_activation_bases_full([train_data[0]["prompt_text"]])
     print(f"Layers: {len(controller.layers)} | hybrid_switch_step: {controller.hybrid_switch_step}")

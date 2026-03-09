@@ -3,12 +3,13 @@
 Algorithm-only implementation — no vLLM imports. All inference calls go
 through the backend object passed at init.
 
-Components:
+Self-adaptive, parameter-free optimizer:
+- LR: self-calibrating eps/dd_ema * cosine (Spall 1998 §7: a ~ c²)
+- Momentum: self-adaptive 1 - _ema_alpha() (VA-Muon complement)
 - AGZO activation-guided subspace perturbation
-- SPSA gradient estimation with ZClip z-score clipping on directional derivative
+- SPSA gradient estimation with ZClip reciprocal clipping (2504.02507)
 - ZO-Muon spectral optimizer (Newton-Schulz orthogonalization)
 - RLOO contrastive selection with REINFORCE++ normalization
-- Cosine temperature annealing for exploration
 - Hybrid SFT→RL training pipeline
 
 Reference: DS_MeZO_Combined.md §8
@@ -29,13 +30,14 @@ from ds_mezo.kernels import zo_muon_update, fused_power_iter, fused_agzo_perturb
 from ds_mezo.model_config import LayerSpec
 
 # Config defaults — matches YAML config surface.
-# Auto-calibrated parameters (derived from adapter/data):
-#   rank: inferred from adapter tensor shapes
-#   r_calib: rank // 2 (dominant activation subspace)
-#   T_min: T_max / num_candidates (maintain RLOO diversity)
+# Self-adaptive parameters (no manual tuning):
+#   eta: self-calibrating eps/dd_ema * cosine (Spall 1998 §7: a ~ c²)
+#   momentum: self-adaptive 1 - _ema_alpha() (VA-Muon complement)
 #   eps: 1e-3 / sqrt(rank) (SPSA theory — Spall 1998)
-#   EMA: adaptive window from step count (VA-Muon — 2601.14603)
-#   DD clipping: 3-sigma from tracked variance (ZClip — 2504.02507)
+#   DD clipping: z_thres=2.5 reciprocal clipping (ZClip — 2504.02507, Algorithm 1)
+# Protocol constants (not configurable):
+#   num_candidates=4 (RLOO canonical — Ahmadian et al. 2024)
+#   temperature: cosine decay from 1.0 (softmax identity) to 0.0
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "output_dir": "output",
     "staging_dir": "/dev/shm/ds_mezo",
@@ -43,10 +45,6 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "model_path": "",
     "total_steps": 1000,
     "hybrid_switch_step": 0,
-    "eta_max": 1e-4,
-    "momentum": 0.9,
-    "num_candidates": 4,
-    "T_max": 1.0,
     "seed": 42,
     "score_fn": None,
 }
@@ -122,20 +120,17 @@ class DSMeZO_Controller:
         # Initial adapter sync
         self.backend.sync_adapters({}, {}, self.layers)
 
-        # Exploration — cosine temperature annealing (§7.3)
-        self.num_candidates: int = cfg["num_candidates"]
-        self.T_max: float = cfg["T_max"]
-        self.T_min = self.T_max / self.num_candidates
-        self.explore_temperature = self.T_max
+        # Exploration — RLOO canonical sample count (Ahmadian et al. 2024)
+        # Cosine temperature from 1.0 (softmax identity) to 0.0 (greedy)
+        self.num_candidates = 4
+        self.explore_temperature = 1.0
 
         # Fixed epsilon (FlatZero — 2506.05454: fixed ε preserves flat-minima regularization)
         # SPSA theory (Spall 1998): optimal perturbation scale c₀ ≈ 1e-3 / sqrt(rank)
         self.eps = 1e-3 / math.sqrt(rank)
 
-        # Optimizer: ZO-Muon (§5)
-        self.eta_max: float = cfg["eta_max"]
-        self.eta = self.eta_max
-        self.momentum: float = cfg["momentum"]
+        # Optimizer: ZO-Muon (§5) — LR self-calibrates from eps/dd_ema after step 1
+        self.eta = self.eps
 
         # Pre-allocate momentum, scratch, and perturbation output buffers
         self.momentum_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
@@ -155,7 +150,10 @@ class DSMeZO_Controller:
             self.neg_buffers[key_B] = torch.empty_like(layer.B)
 
         # Activation subspace tracking — per-step power iteration (§3.5)
-        # r_calib = rank/2: top half of singular spectrum captures >80% of variance
+        # r_calib = rank/2: for LoRA-rank adapters, the subspace dimension should be
+        # proportional to adapter rank. AGZO (2601.17261) uses r=1 for full-weight
+        # perturbations; for rank-r LoRA, rank//2 spans the dominant subspace while
+        # keeping memory proportional to adapter size.
         self.r_calib = rank // 2
         # Warm-started power iteration converges cubically (Halko et al. 2011, §4.4).
         # 3 iterations: error ∝ ε₀^27 ≈ 0 for any reasonable ε₀ < 0.5.
@@ -264,13 +262,9 @@ class DSMeZO_Controller:
     # -- Exploration (§4.1, §4.2) -------------------------------------------
 
     def _update_temperature(self) -> None:
-        """Cosine temperature annealing (§7.3)."""
+        """Cosine temperature decay: 1.0 (softmax identity) → 0.0 (greedy)."""
         progress = self.step_count / self.total_steps
-        self.explore_temperature = (
-            self.T_min
-            + 0.5 * (self.T_max - self.T_min)
-            * (1 + math.cos(math.pi * progress))
-        )
+        self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
 
     def _explore(
         self, batch: list[str],
@@ -319,9 +313,12 @@ class DSMeZO_Controller:
     # -- ZClip (2504.02507) -------------------------------------------------
 
     def _zclip(self, dd: float) -> float:
-        """ZClip: z-score clipping on directional derivative (2504.02507).
+        """ZClip: reciprocal clipping on directional derivative (2504.02507, Algorithm 1).
 
-        Clips at dd_ema ± 3·σ (Chebyshev: ≤1/9 false positive for any distribution).
+        Reciprocal clipping: z* = z_thres² / z for z > z_thres.
+        Clips more aggressively for larger outliers while remaining continuous
+        at the threshold (ZClip paper §2.3.2, recommended over hard clipping).
+        z_thres=2.5 per paper's empirical recommendation.
         """
         alpha = self._ema_alpha()
         abs_dd = abs(dd)
@@ -331,8 +328,16 @@ class DSMeZO_Controller:
             return dd
 
         dd_std = math.sqrt(self.dd_var_ema)
-        clip_bound = self.dd_ema + 3.0 * dd_std
-        clipped = max(-clip_bound, min(dd, clip_bound))
+        z_thres = 2.5
+        z_score = (abs_dd - self.dd_ema) / (dd_std + 1e-8)
+
+        if z_score > z_thres:
+            # Reciprocal clipping: map z → z_thres² / z (continuous at z=z_thres)
+            clipped_z = z_thres ** 2 / z_score
+            clipped_abs = self.dd_ema + clipped_z * dd_std
+            clipped = math.copysign(clipped_abs, dd)
+        else:
+            clipped = dd
 
         diff = abs_dd - self.dd_ema
         self.dd_ema += alpha * diff
@@ -340,12 +345,17 @@ class DSMeZO_Controller:
 
         return clipped
 
-    # -- Cosine LR (§5.3) --------------------------------------------------
+    # -- Self-calibrating LR (§5.3) ----------------------------------------
 
     def _update_lr(self) -> None:
-        """Cosine decay to zero (D2Z — CoLLAs 2025)."""
+        """Self-calibrating LR: eps/dd_ema * cosine (Spall 1998 §7: a ~ c²).
+
+        eps/dd_ema ≈ eps²/loss_scale — gives the theoretically optimal
+        step-to-perturbation ratio while being scale-invariant.
+        """
         progress = self.step_count / self.total_steps
-        self.eta = 0.5 * self.eta_max * (1 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        self.eta = self.eps / self.dd_ema * cosine
 
     # -- Unified Training Step ----------------------------------------------
 
@@ -393,7 +403,10 @@ class DSMeZO_Controller:
         # ZO-Muon update with ZClip
         raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
         dd = self._zclip(raw_dd)
-        effective_eta = self.eta
+
+        # Self-adaptive momentum: 1 - _ema_alpha() (VA-Muon complement)
+        # Starts at 0 (step 1: fully responsive), ramps to 1 - 1/sqrt(total_steps)
+        momentum = 1.0 - self._ema_alpha()
 
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
@@ -401,10 +414,10 @@ class DSMeZO_Controller:
             key_B = (layer.key, "B")
             zo_muon_update(layer.A, self.momentum_buffers[key_A],
                            z_A, self.scratch_buffers[key_A],
-                           dd, self.momentum, effective_eta)
+                           dd, momentum, self.eta)
             zo_muon_update(layer.B, self.momentum_buffers[key_B],
                            z_B, self.scratch_buffers[key_B],
-                           dd, self.momentum, effective_eta)
+                           dd, momentum, self.eta)
 
         # Schedule updates
         self._update_lr()
