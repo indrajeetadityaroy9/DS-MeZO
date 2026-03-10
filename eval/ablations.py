@@ -1,25 +1,17 @@
-"""DS-MeZO ablation evaluation: 4 experiments proving spec claims.
-
-Experiment 0: Memory measurement (§1 near-inference cost)
-Experiments 1-3: Controlled A/B ablations, each disabling one component.
-
-Training uses MBPP train split with execution-based reward.
-Evaluation uses MBPP test split pass@1 (greedy, execution-based).
-
-Usage: python -m eval.ablations --model-path <path> --adapter-path <path>
-"""
+"""DS-MeZO ablation evaluation: memory measurement + 3 controlled A/B ablations."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import math
 import time
 import types
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
+from peft import PeftConfig
 
 from vllm import LLM
 from ds_mezo.model_config import LayerSpec, discover_layers
@@ -41,7 +33,6 @@ def run_experiment(
     train_data: list[dict[str, Any]],
     rank: int,
 ) -> dict[str, Any]:
-    """Run a single experiment: init controller, train, eval, return results."""
     torch.manual_seed(42)
     experiment_dir = output_dir / name
     experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -57,12 +48,8 @@ def run_experiment(
     backend = VLLMBackend(llm, layer_specs, rank)
     controller = DSMeZO_Controller(backend, layer_specs, config)
 
-    # Memory measurement via nvidia-smi (vLLM loads model in subprocess)
-    nvsmi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True,
-    )
-    mem_after_init = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
+    free, total = torch.cuda.mem_get_info()
+    mem_after_init = (total - free) / (1024 ** 3)
 
     controller._calibrate_activation_bases_full([train_data[0]["prompt"]])
     patch_fn(controller)
@@ -74,28 +61,24 @@ def run_experiment(
         controller.step([problem["prompt"]])
         if (step_idx + 1) % 50 == 0:
             print(f"    [{name}] step {step_idx+1}/{TOTAL_STEPS} "
-                  f"dd_ema={controller.dd_ema:.2e} lr={controller.eta:.2e}")
+                  f"lr={controller.eta:.2e}")
     train_time = time.time() - t0
 
-    mem_peak = torch.cuda.max_memory_allocated() / 1e9
+    mem_peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-    # Post-training eval: MBPP pass@1 (greedy, execution-based)
     controller.backend.sync_adapters({}, {}, controller.layers)
     mbpp_result = eval_mbpp(llm, lora_request=backend.lora_pos, n_samples=1, temperature=0.0)
 
     result = {
         "name": name,
         "pass@1": mbpp_result["pass@1"],
-        "dd_ema": controller.dd_ema,
+        "pass@1_ci95": mbpp_result["pass@1_ci95"],
         "train_time": train_time,
         "mem_after_init": mem_after_init,
         "mem_peak": mem_peak,
     }
 
-    del controller
-    del backend
     torch.cuda.reset_peak_memory_stats()
-
     return result
 
 
@@ -130,16 +113,15 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
         loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
 
-        raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
-        dd = self._zclip(raw_dd)
+        dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
+
+        max_window = int(math.sqrt(self.total_steps))
+        mom = 1.0 - 1.0 / min(self.step_count, max_window)
 
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
             key_A = (layer.key, "A")
             key_B = (layer.key, "B")
-
-            # SGD+momentum (no Newton-Schulz)
-            mom = 1.0 - self._ema_alpha()
             grad_A = dd * z_A
             self.momentum_buffers[key_A].mul_(mom).add_((1 - mom) * grad_A)
             layer.A.sub_(self.eta * self.momentum_buffers[key_A])
@@ -148,8 +130,10 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
             self.momentum_buffers[key_B].mul_(mom).add_((1 - mom) * grad_B)
             layer.B.sub_(self.eta * self.momentum_buffers[key_B])
 
-        self._update_lr()
-        self._update_temperature()
+        self.lr_scheduler.step()
+        self.eta = self._lr_opt.param_groups[0]["lr"]
+        progress = self.step_count / self.total_steps
+        self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
 
     controller.step = types.MethodType(patched_step, controller)
 
@@ -208,12 +192,10 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config
-    adapter_config = json.loads((args.adapter_path / "adapter_config.json").read_text())
-    rank = adapter_config["r"]
-    target_modules = adapter_config["target_modules"]
+    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
+    rank = peft_config.r
+    target_modules = list(peft_config.target_modules)
 
-    # Load MBPP train split for training data
     train_data = load_mbpp_train()
 
     print("=" * 70)
@@ -227,28 +209,22 @@ def main() -> None:
     llm = LLM(
         model=str(args.model_path),
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
-    # Discover layers once
     layer_specs = discover_layers(args.model_path, target_modules)
 
-    # Experiment 0: inference-only memory baseline
-    nvsmi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True,
-    )
-    mem_inference = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
+    free, total = torch.cuda.mem_get_info()
+    mem_inference = (total - free) / (1024 ** 3)
     print(f"\n=== §1 Memory Baseline ===")
-    print(f"  Inference VRAM (nvidia-smi): {mem_inference:.3f} GB")
+    print(f"  Inference VRAM: {mem_inference:.3f} GB")
 
     torch.cuda.reset_peak_memory_stats()
 
-    # Run all experiments
     results: list[dict[str, Any]] = []
     for i, exp in enumerate(EXPERIMENTS):
         print(f"\n--- Experiment {i+1}/{len(EXPERIMENTS)}: {exp['name']} ---")
@@ -258,10 +234,8 @@ def main() -> None:
         )
         results.append(result)
         print(f"  pass@1: {result['pass@1']:.1%} | "
-              f"DD EMA: {result['dd_ema']:.2e} | "
               f"Time: {result['train_time']:.1f}s")
 
-    # Print results
     print("\n" + "=" * 70)
     print("§1 MEMORY: NEAR-INFERENCE COST")
     print("=" * 70)
@@ -277,10 +251,11 @@ def main() -> None:
     print("\n" + "=" * 70)
     print(f"ABLATION RESULTS ({TOTAL_STEPS} steps)")
     print("=" * 70)
-    print(f"{'Experiment':<16} | {'pass@1':>7} | {'dd EMA':>10} | {'Time':>6}")
-    print("-" * 50)
+    print(f"{'Experiment':<16} | {'pass@1':>7} | {'95% CI':>17} | {'Time':>6}")
+    print("-" * 60)
     for r in results:
-        print(f"{r['name']:<16} | {r['pass@1']:6.1%} | {r['dd_ema']:>10.4f} | {r['train_time']:5.1f}s")
+        ci = r['pass@1_ci95']
+        print(f"{r['name']:<16} | {r['pass@1']:6.1%} | {ci[0]:6.1%}–{ci[1]:6.1%} | {r['train_time']:5.1f}s")
 
     # Delta from control
     ctrl_pass = results[0]["pass@1"]
@@ -289,6 +264,14 @@ def main() -> None:
     for r in results[1:]:
         delta = r["pass@1"] - ctrl_pass
         print(f"{r['name']:<16} | {delta:>+15.1%}")
+
+    results_path = args.output_dir / "ablation_results.json"
+    with open(results_path, "w") as f:
+        json.dump({
+            "mem_inference_gb": mem_inference,
+            "experiments": results,
+        }, f, indent=2, default=str)
+    print(f"\nResults saved to {results_path}")
 
 
 if __name__ == "__main__":

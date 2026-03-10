@@ -1,11 +1,4 @@
-"""DS-MeZO RL proof-of-concept: train on MBPP, evaluate on MBPP pass@k.
-
-Single experiment — DS-MeZO full system. Model-agnostic.
-Proves zeroth-order RL post-training improves code generation
-on a standard benchmark without backpropagation.
-
-Usage: python -m eval.rl_bench_eval --model-path <path> --adapter-path <path> --output-dir <path>
-"""
+"""DS-MeZO RL proof-of-concept: train on MBPP, evaluate pass@k."""
 
 from __future__ import annotations
 
@@ -14,6 +7,8 @@ import json
 import time
 from pathlib import Path
 
+import torch
+from peft import PeftConfig
 from vllm import LLM
 
 from ds_mezo.model_config import discover_layers
@@ -37,10 +32,9 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config
-    adapter_config = json.loads((args.adapter_path / "adapter_config.json").read_text())
-    rank = adapter_config["r"]
-    target_modules = adapter_config["target_modules"]
+    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
+    rank = peft_config.r
+    target_modules = list(peft_config.target_modules)
 
     print("=" * 70)
     print("DS-MeZO RL PROOF-OF-CONCEPT")
@@ -48,46 +42,39 @@ def main() -> None:
     print(f"Train: MBPP train | Eval: MBPP pass@k (n={args.n_samples}, T={args.temperature})")
     print("=" * 70)
 
-    # Load training data
     train_data = load_mbpp_train()
-    print(f"Training data: {len(train_data)} MBPP problems")
 
-    # Load engine
     print("\nLoading vLLM engine...")
     t0 = time.time()
     llm = LLM(
         model=str(args.model_path),
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
-    # Init controller
     reward, set_problem = make_exec_reward()
     layer_specs = discover_layers(args.model_path, target_modules)
     backend = VLLMBackend(llm, layer_specs, rank)
     controller = DSMeZO_Controller(backend, layer_specs, {
         "output_dir": str(args.output_dir),
         "adapter_path": str(args.adapter_path),
-        "model_path": str(args.model_path),
         "score_fn": reward,
         "total_steps": args.total_steps,
     })
     controller._calibrate_activation_bases_full([train_data[0]["prompt"]])
-    print(f"Layers: {len(layer_specs)} | Params: {sum(l.A.numel()+l.B.numel() for l in controller.layers):,}")
 
-    # Pre-training baseline
     print("\n--- Pre-training baseline ---")
     controller.backend.sync_adapters({}, {}, controller.layers)
     pre_mbpp = eval_mbpp(llm, lora_request=backend.lora_pos, n_samples=args.n_samples, temperature=args.temperature)
-    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} ({pre_mbpp['num_tasks']} tasks)")
-    if "pass@10" in pre_mbpp:
-        print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%}")
+    ci = pre_mbpp['pass@1_ci95']
+    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {pre_mbpp['num_tasks']} tasks)")
+    ci10 = pre_mbpp['pass@10_ci95']
+    print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
 
-    # Train
     total_steps = controller.total_steps
     print(f"\n--- Training ({total_steps} steps, {len(train_data)} problems) ---")
     t_start = time.time()
@@ -99,47 +86,29 @@ def main() -> None:
 
         log.append({
             "step": step_idx + 1,
-            "dd_ema": controller.dd_ema,
             "eta": controller.eta,
             "eps": controller.eps,
         })
 
         if (step_idx + 1) % 100 == 0:
-            elapsed = time.time() - t_start
-            s_per_step = elapsed / (step_idx + 1)
-            print(f"  step {step_idx+1:4d}/{total_steps} | "
-                  f"dd_ema={controller.dd_ema:.4f} | "
-                  f"lr={controller.eta:.2e} | "
-                  f"{s_per_step:.1f}s/step")
+            print(f"  step {step_idx+1}/{total_steps} | lr={controller.eta:.2e}")
 
     train_time = time.time() - t_start
     print(f"\nTraining complete: {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
 
-    # Post-training eval
-    print("\n--- Post-training evaluation ---")
+    print("\n--- Post-training ---")
     controller.backend.sync_adapters({}, {}, controller.layers)
     post_mbpp = eval_mbpp(llm, lora_request=backend.lora_pos, n_samples=args.n_samples, temperature=args.temperature)
-    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} ({post_mbpp['num_tasks']} tasks)")
-    if "pass@10" in post_mbpp:
-        print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%}")
+    ci = post_mbpp['pass@1_ci95']
+    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {post_mbpp['num_tasks']} tasks)")
+    ci10 = post_mbpp['pass@10_ci95']
+    print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
 
-    # Summary
     delta_1 = post_mbpp['pass@1'] - pre_mbpp['pass@1']
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-    print(f"  MBPP pass@1 pre:    {pre_mbpp['pass@1']:.1%}")
-    print(f"  MBPP pass@1 post:   {post_mbpp['pass@1']:.1%}")
-    print(f"  Delta pass@1:       {delta_1:+.1%}")
-    if "pass@10" in pre_mbpp and "pass@10" in post_mbpp:
-        delta_10 = post_mbpp['pass@10'] - pre_mbpp['pass@10']
-        print(f"  MBPP pass@10 pre:   {pre_mbpp['pass@10']:.1%}")
-        print(f"  MBPP pass@10 post:  {post_mbpp['pass@10']:.1%}")
-        print(f"  Delta pass@10:      {delta_10:+.1%}")
-    print(f"  Final DD EMA:       {controller.dd_ema:.4f}")
-    print(f"  Training time:      {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
+    print(f"\n  pass@1: {pre_mbpp['pass@1']:.1%} → {post_mbpp['pass@1']:.1%} ({delta_1:+.1%})")
+    print(f"  pass@10: {pre_mbpp['pass@10']:.1%} → {post_mbpp['pass@10']:.1%}")
+    print(f"  Time: {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
 
-    # Save
     results_path = args.output_dir / "rl_bench_results.json"
     with open(results_path, "w") as f:
         json.dump({

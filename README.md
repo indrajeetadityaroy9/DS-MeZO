@@ -22,21 +22,19 @@ DS-MeZO removes all three constraints. The optimizer estimates gradients via for
 
 **PiSSA Subspace Initialization** (`scripts/prepare_pissa.py`) — Decompose pretrained weight matrices via truncated SVD into a low-rank adapter (A, B) and residual: W = A@B + W_res. The adapter captures the top singular components, providing an information-dense starting point. PiSSA adapters are natively LoRA-compatible — no custom inference code required.
 
-**AGZO (Activation-Guided Zeroth-Order)** (`controller.py:_get_perturbation()` → `kernels.py:fused_agzo_perturbation()`) — Perturbations are projected into the activation subspace of the current batch rather than applied in the full parameter space. For B matrices (r × d_in), perturbations are projected into the top-r_calib right singular vectors of the activation matrix; for A matrices (d_out × r), perturbations are projected into B's column space. This reduces effective ZO dimensionality by ~8x, concentrating gradient signal where the model actually operates. Activation bases are tracked online via warm-started power iteration (`kernels.py:fused_power_iter()`), initialized by full SVD calibration.
+**AGZO (Activation-Guided Zeroth-Order)** (`controller.py:_get_perturbation()` → `kernels.py:fused_agzo_perturbation()`) — Perturbations are projected into the activation subspace of the current batch rather than applied in the full parameter space. For B matrices (r × d_in), perturbations are projected into the top-r_calib right singular vectors of the activation matrix; for A matrices (d_out × r), perturbations are projected into B's column space. This reduces effective ZO dimensionality by ~8x, concentrating gradient signal where the model actually operates. Activation bases are tracked online via warm-started subspace iteration (`kernels.py:fused_power_iter()`), initialized by full SVD calibration with Gavish-Donoho optimal rank threshold (Marchenko-Pastur, IEEE Trans. Info. Theory 2014).
 
 **RLOO (REINFORCE Leave-One-Out)** (`controller.py:_explore()`) — Generate N=4 candidates under unperturbed weights, score with the task reward function, compute leave-one-out advantages: adv_i = r_i - mean(r_j, j != i). Unbiased, minimum-variance, no tunable baseline. Combined with trajectory locking: candidates are generated once, then scored under both perturbed weight configurations for SPSA.
 
 **Contrastive Scoring** (`controller.py:_score_contrastive()`) — Advantage-weighted NLL under θ+ (base + εz) and θ- (base - εz). The directional derivative dd = (loss+ - loss-) / 2ε is a scalar shared across all layers — the SPSA key insight that makes ZO tractable for millions of parameters.
 
-**ZO-Muon Spectral Update** (`kernels.py:zo_muon_update()`) — Fused Triton kernel: SPSA gradient → momentum accumulation → Frobenius normalization → 5-iteration Newton-Schulz orthogonalization → parameter update. Newton-Schulz extracts dominant spectral directions from momentum-accumulated ZO gradients, denoising correlated estimates from the fixed AGZO subspace. Dispatches tall (d_out > r) vs wide (d_out ≤ r) kernel variants.
+**ZO-Muon Spectral Update** (`kernels.py:zo_muon_update()`) — Fused Triton kernel: SPSA gradient → adaptive momentum → Frobenius normalization → 3-term Newton-Schulz orthogonalization (canonical Muon coefficients) → parameter update. Newton-Schulz extracts dominant spectral directions from momentum-accumulated ZO gradients, denoising correlated estimates from the fixed AGZO subspace. Dispatches tall (d_out > r) vs wide (d_out ≤ r) kernel variants. N-S iteration count derived via scalar simulation for `s_min = 1/√rank`.
 
-**ZClip** (`controller.py:_zclip()`) — Reciprocal z-score clipping on the directional derivative. When z > z_thres (2.5), clips to z* = z_thres²/z — preserves sign and direction while bounding magnitude. Uses adaptive EMA variance tracking (VA-Muon window: α = 1/min(step, √total_steps)).
-
-**Self-Calibrating Schedules** — All optimizer hyperparameters are derived from internal signals, eliminating manual tuning:
-- **Learning rate** (`_update_lr()`): η = ε/dd_ema × cosine (Spall 1998 §7: optimal a ~ c²). Scale-invariant.
-- **Momentum** (`step()`): 1 - α where α is the VA-Muon EMA coefficient. Ramps from 0 (responsive) to 1 - 1/√T (stable).
-- **Temperature** (`_update_temperature()`): Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
-- **Epsilon**: 1e-3/√rank. Fixed per SPSA theory (Spall 1998) and FlatZero flat-minima regularization.
+**Derived Schedules** — All optimizer hyperparameters are derived from model weights and dtype at init, eliminating manual tuning:
+- **Epsilon**: `median(‖W‖_F) * eps_machine^(1/3)` (Numerical Recipes §5.7 optimal centered-difference step). Scale-invariant, derived from weight norms.
+- **Learning rate**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes the update unit-spectral-norm; trust-region argument: step no further than the perturbation radius where the gradient estimate is valid.
+- **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
+- **Temperature**: Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
 
 ### Architecture
 
@@ -120,7 +118,7 @@ python -m eval.ablations --model-path /dev/shm/pissa_prep/residual --adapter-pat
 
 ```
 ds_mezo/
-  controller.py    — Core algorithm: SPSA, AGZO, RLOO, ZO-Muon, ZClip, schedules
+  controller.py    — Core algorithm: SPSA, AGZO, RLOO, ZO-Muon, cosine schedules
   backend.py       — vLLM adapter serialization, scoring, activation hooks
   kernels.py       — Four fused Triton kernels (zo_muon_update, fused_power_iter,
                      fused_agzo_perturbation, fused_perturb_dual)
@@ -159,7 +157,7 @@ Four controlled experiments isolating each novel component's contribution. Each 
 | Experiment | Ablation | Method |
 |:---|:---|:---|
 | `control` | None (full system) | Baseline |
-| `no_zomuon` | Replace ZO-Muon with SGD+momentum | Skip Newton-Schulz orthogonalization |
+| `no_zomuon` | Replace ZO-Muon with SGD+momentum | Skip 3-term Newton-Schulz orthogonalization |
 | `no_agzo` | Replace AGZO with random perturbation | Random orthonormal basis instead of activation subspace |
 | `static_bases` | Freeze activation bases at init | No per-step power iteration update |
 
@@ -184,8 +182,7 @@ Comparison axes: pass@1 improvement, peak VRAM, training throughput. If DS-MeZO 
 - **AGZO** (arXiv:2601.17261) — Activation-guided zeroth-order optimization
 - **ZO-Muon** (arXiv:2602.17155) — Zeroth-order Muon optimizer
 - **RLOO** (Ahmadian et al., 2024) — REINFORCE Leave-One-Out baseline
-- **ZClip** (arXiv:2504.02507) — Reciprocal z-score gradient clipping
-- **VA-Muon** (arXiv:2601.14603) — Variance-adaptive EMA for momentum
+- **Muon** (Keller Jordan, 2024; `torch.optim.Muon` in PyTorch 2.10) — Newton-Schulz orthogonalization for optimizer updates
 
 ## License
 

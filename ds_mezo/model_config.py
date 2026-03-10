@@ -1,9 +1,4 @@
-"""Model-agnostic layer discovery via PyTorch meta-device introspection.
-
-Uses AutoConfig + AutoModelForCausalLM on torch.device("meta") to discover
-trainable linear layers without loading weights (zero memory). Works for any
-HuggingFace causal LM architecture.
-"""
+"""Layer discovery via meta-device introspection (zero memory)."""
 
 from __future__ import annotations
 
@@ -25,12 +20,6 @@ class LayerSpec:
 def discover_layers(
     model_path: str | Path, target_modules: list[str],
 ) -> list[LayerSpec]:
-    """Discover trainable layers via PyTorch model introspection.
-
-    Instantiates an empty model on meta device (zero memory), iterates
-    named_modules() to find nn.Linear layers matching target_modules,
-    and returns LayerSpec for each (layer_idx, module) pair.
-    """
     config = AutoConfig.from_pretrained(str(model_path))
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
@@ -51,5 +40,4 @@ def discover_layers(
             peft_prefix="base_model.model." + name,
         ))
 
-    del model
     return sorted(specs, key=lambda s: (s.layer_idx, s.module_name))

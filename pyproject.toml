@@ -12,16 +12,15 @@ dependencies = [
     "vllm==0.17.0",
     "safetensors==0.7.0",
     "transformers==4.56.0",
+    "peft==0.15.0",
     "datasets==3.5.0",
     "evaluate==0.4.3",
     "PyYAML==6.0.1",
-]
-
-[project.optional-dependencies]
-baselines = [
-    "trl>=0.16.0",
-    "peft>=0.15.0",
-    "accelerate>=1.5.0",
+    "scipy==1.15.0",
+    "numpy==2.2.0",
+    "optht==0.2.0",
+    "trl==0.16.0",
+    "accelerate==1.5.0",
 ]
 
 [project.scripts]
@@ -29,4 +28,4 @@ ds-mezo-train = "scripts.train:main"
 ds-mezo-pissa = "scripts.prepare_pissa:main"
 
 [tool.setuptools.packages.find]
-include = ["ds_mezo*", "eval*", "scripts*", "tests*"]
+include = ["ds_mezo*", "scripts*", "eval*"]

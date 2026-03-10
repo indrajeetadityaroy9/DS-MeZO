@@ -1,41 +1,25 @@
-"""vLLM backend: all inference-engine-specific code isolated here.
-
-The controller calls backend methods that return plain Python types,
-keeping the algorithm completely vLLM-free.
-
-Adapter hot-swap writes to tmpfs (staging_dir, default /dev/shm/ds_mezo)
-for zero-copy loading by vLLM. Activation extraction uses collective_rpc
-forward hooks.
-"""
+"""vLLM backend: adapter hot-swap, scoring, and activation extraction."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import torch
+from peft import LoraConfig
 from safetensors.torch import save_file
 from vllm import SamplingParams
 from vllm.lora.request import LoRARequest
 
-# vLLM merges these projections into fused modules at runtime.
 _VLLM_MERGES: dict[str, str] = {
     "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
     "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj",
 }
 
 
-# Module-level functions (picklable for collective_rpc)
-
 def _register_activation_hooks(
     worker: Any, hook_map: dict[str, list[str]],
 ) -> int:
-    """Register forward hooks on vLLM's worker model.
-
-    hook_map: {vllm_suffix: [original_module_names]}
-    e.g. {"qkv_proj": ["q_proj", "v_proj"]}
-    """
     model = worker.get_model()
     worker._ds_mezo_hooks = []
     worker._ds_mezo_activations = {}
@@ -64,9 +48,16 @@ def _register_activation_hooks(
 def _collect_and_remove_hooks(
     worker: Any,
 ) -> dict[tuple[int, str], torch.Tensor]:
-    """Collect activations and remove hooks."""
-    # .cpu() required: collective_rpc serializes returns across process boundary
-    activations = {k: v.cpu() for k, v in worker._ds_mezo_activations.items()}
+    seen: dict[int, torch.Tensor] = {}
+    activations: dict[tuple[int, str], torch.Tensor] = {}
+    for k, v in worker._ds_mezo_activations.items():
+        tid = id(v)
+        if tid not in seen:
+            cpu_t = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+            cpu_t.copy_(v, non_blocking=True)
+            seen[tid] = cpu_t
+        activations[k] = seen[tid]
+    torch.cuda.current_stream().synchronize()
     for h in worker._ds_mezo_hooks:
         h.remove()
     worker._ds_mezo_hooks = []
@@ -88,17 +79,14 @@ def _extract_prompt_logprobs(
 def _write_adapter_config(
     adapter_dir: Path, rank: int, target_modules: list[str],
 ) -> None:
-    """Write PEFT adapter config JSON."""
-    config = {
-        "peft_type": "LORA",
-        "r": rank,
-        "lora_alpha": rank,
-        "target_modules": target_modules,
-        "bias": "none",
-        "task_type": "CAUSAL_LM",
-    }
-    with open(adapter_dir / "adapter_config.json", "w") as f:
-        json.dump(config, f)
+    config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        target_modules=target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    config.save_pretrained(str(adapter_dir))
 
 
 def _save_peft_adapter(
@@ -106,25 +94,24 @@ def _save_peft_adapter(
     B_list: list[torch.Tensor],
     adapter_dir: Path,
     layers: list[Any],
+    bf16_cache: dict[str, torch.Tensor],
 ) -> None:
-    """Serialize A, B matrices as PEFT-compatible LoRA adapter (BF16).
-
-    PiSSA convention: W = W_res + A @ B where A:(d_out, r), B:(r, d_in)
-    PEFT convention:  W = W0 + lora_B @ lora_A where lora_A:(r, d_in), lora_B:(d_out, r)
-    Therefore: lora_A.weight = B, lora_B.weight = A
-
-    Writes to staging_dir (tmpfs) for zero-copy vLLM loading.
-    """
+    """Serialize A, B as PEFT adapter. lora_A.weight = B, lora_B.weight = A (PiSSA↔PEFT swap)."""
     tensors: dict[str, torch.Tensor] = {}
     for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
         prefix = layers[layer_idx].peft_prefix
-        tensors[f"{prefix}.lora_A.weight"] = B_l.contiguous().bfloat16()
-        tensors[f"{prefix}.lora_B.weight"] = A_l.contiguous().bfloat16()
+        key_a = f"{prefix}.lora_A.weight"
+        key_b = f"{prefix}.lora_B.weight"
+        if key_a not in bf16_cache:
+            bf16_cache[key_a] = torch.empty_like(B_l, dtype=torch.bfloat16)
+            bf16_cache[key_b] = torch.empty_like(A_l, dtype=torch.bfloat16)
+        bf16_cache[key_a].copy_(B_l)
+        bf16_cache[key_b].copy_(A_l)
+        tensors[key_a] = bf16_cache[key_a]
+        tensors[key_b] = bf16_cache[key_b]
 
     save_file(tensors, str(adapter_dir / "adapter_model.safetensors"))
 
-
-# Backend class
 
 class VLLMBackend:
     def __init__(
@@ -134,7 +121,6 @@ class VLLMBackend:
         self.engine = engine
         self.rank = rank
 
-        # Build hook_map from target modules + vLLM merge knowledge
         hook_map: dict[str, set[str]] = {}
         for ls in layer_specs:
             vllm_name = _VLLM_MERGES.get(ls.module_name, ls.module_name)
@@ -143,7 +129,6 @@ class VLLMBackend:
             k: sorted(v) for k, v in hook_map.items()
         }
 
-        # Adapter staging on tmpfs for zero-copy vLLM loading
         unique_modules = sorted({ls.module_name for ls in layer_specs})
         staging = Path(staging_dir)
         (staging / "adapter_pos").mkdir(parents=True, exist_ok=True)
@@ -161,17 +146,15 @@ class VLLMBackend:
             max_tokens=1, prompt_logprobs=1, temperature=0.0
         )
 
+        self._bf16_pos: dict[str, torch.Tensor] = {}
+        self._bf16_neg: dict[str, torch.Tensor] = {}
+
     def sync_adapters(
         self,
         pos_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         neg_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         layers: list[Any],
     ) -> None:
-        """Sync PiSSA adapters to vLLM engine via tmpfs staging.
-
-        Writes safetensors to staging_dir (tmpfs, RAM-backed) then triggers
-        vLLM adapter reload. load_inplace=True enables zero-copy mmap loading.
-        """
         def get_AB(
             overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
         ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -189,18 +172,16 @@ class VLLMBackend:
         A_pos, B_pos = get_AB(pos_overrides)
         A_neg, B_neg = get_AB(neg_overrides)
 
-        _save_peft_adapter(A_pos, B_pos, self.adapter_dir_pos, layers)
-        _save_peft_adapter(A_neg, B_neg, self.adapter_dir_neg, layers)
+        _save_peft_adapter(A_pos, B_pos, self.adapter_dir_pos, layers, self._bf16_pos)
+        _save_peft_adapter(A_neg, B_neg, self.adapter_dir_neg, layers, self._bf16_neg)
 
-        # Reload adapters from tmpfs (no inference, direct API)
         self.engine.llm_engine.add_lora(self.lora_pos)
         self.engine.llm_engine.add_lora(self.lora_neg)
 
     def generate(
         self, batch: list[str], temperature: float, n: int,
     ) -> list[Any]:
-        """Generate N candidates with per-token logprobs. Returns list of RequestOutput."""
-        gen_params = SamplingParams(n=n, temperature=temperature, logprobs=1)
+        gen_params = SamplingParams(n=n, temperature=temperature)
         return self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
         )
@@ -208,7 +189,6 @@ class VLLMBackend:
     def score(
         self, token_sequences: list[list[int]], lora_request: LoRARequest,
     ) -> list[list[float]]:
-        """Prefill-only logprob extraction. Returns list[list[float]]."""
         prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
         outputs = self.engine.generate(
             prompts, sampling_params=self.score_params, lora_request=lora_request,
@@ -221,7 +201,6 @@ class VLLMBackend:
     def extract_activations(
         self, input_data: list[str],
     ) -> dict[tuple[int, str], torch.Tensor]:
-        """Hook-based activation capture. Returns {(layer_idx, module_name): Tensor}."""
         self.engine.collective_rpc(
             _register_activation_hooks, args=(self.hook_map,)
         )

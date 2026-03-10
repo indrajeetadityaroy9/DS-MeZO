@@ -1,13 +1,4 @@
-"""DS-MeZO training entry point.
-
-Usage: bash scripts/launch.sh <config.yaml> <prompts.jsonl>
-
-Environment variables (VLLM_ALLOW_INSECURE_SERIALIZATION, etc.) must be set
-by the caller — see scripts/launch.sh.
-
-Config YAML requires: model_path, adapter_path, output_dir.
-All other hyperparameters use spec defaults from _CONFIG_DEFAULTS.
-"""
+"""DS-MeZO training entry point."""
 
 from __future__ import annotations
 
@@ -15,12 +6,14 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
 import yaml
+from peft import PeftConfig
 from vllm import LLM
 
 from ds_mezo.model_config import discover_layers
 from ds_mezo.backend import VLLMBackend
-from ds_mezo.controller import DSMeZO_Controller, _CONFIG_DEFAULTS
+from ds_mezo.controller import DSMeZO_Controller
 
 
 def main() -> None:
@@ -34,23 +27,22 @@ def main() -> None:
     with open(args.prompts) as f:
         prompts = [json.loads(line)["prompt"] for line in f]
 
-    # Read rank and target modules from adapter config
     adapter_path = Path(config["adapter_path"])
-    adapter_config = json.loads((adapter_path / "adapter_config.json").read_text())
-    rank = adapter_config["r"]
-    target_modules = adapter_config["target_modules"]
+    peft_config = PeftConfig.from_pretrained(str(adapter_path))
+    rank = peft_config.r
+    target_modules = list(peft_config.target_modules)
 
     llm = LLM(
         model=config["model_path"],
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
     )
 
     layer_specs = discover_layers(config["model_path"], target_modules)
-    staging_dir = config.get("staging_dir", _CONFIG_DEFAULTS["staging_dir"])
+    staging_dir = config.get("staging_dir", "/dev/shm/ds_mezo")
     backend = VLLMBackend(llm, layer_specs, rank, staging_dir=staging_dir)
     controller = DSMeZO_Controller(backend, layer_specs, config)
     controller._calibrate_activation_bases_full([prompts[0]])

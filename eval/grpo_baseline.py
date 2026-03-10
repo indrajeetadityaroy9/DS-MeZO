@@ -1,29 +1,22 @@
-"""GRPO baseline: backprop-based RL post-training on MBPP via TRL.
-
-Comparative baseline for DS-MeZO. Uses the same PiSSA-decomposed model
-and adapter as starting weights, so the only variable is the optimizer
-(backprop GRPO vs zeroth-order SPSA).
-
-Requires: pip install -e ".[baselines]"
-
-Usage: python -m eval.grpo_baseline --model-path <path> --adapter-path <path> --output-dir <path>
-"""
+"""GRPO baseline: backprop-based RL post-training via TRL GRPOTrainer."""
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
-import subprocess
 import time
 from pathlib import Path
 
 import torch
 from datasets import Dataset
-from peft import PeftModel
+from peft import PeftConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from vllm import LLM
 from vllm.lora.request import LoRARequest
+
+import evaluate
 
 from eval.benchmarks import eval_mbpp, load_mbpp_train
 from eval.utils import extract_code
@@ -31,24 +24,28 @@ from eval.utils import extract_code
 
 # ── Reward function (TRL interface) ─────────────────────────────────────────
 
+@functools.lru_cache(maxsize=1)
+def _get_code_eval():
+    return evaluate.load("code_eval")
+
+
 def mbpp_exec_reward(completions: list[str], test_list: list,
                      test_imports: list, **kwargs) -> list[float]:
-    """MBPP execution reward for TRL GRPOTrainer.
-
-    TRL passes dataset columns as kwargs. Each element corresponds to one
-    prompt in the batch. completions[i] is scored against test_list[i].
-    """
+    code_eval = _get_code_eval()
     scores = []
     for completion, tests, imports in zip(completions, test_list, test_imports):
         code = extract_code(completion)
         import_block = "\n".join(imports)
-        passed = 0
-        for test in tests:
-            try:
-                exec(f"{import_block}\n{code}\n{test}", {})
-                passed += 1
-            except Exception:
-                pass
+        references = [f"{import_block}\n{test}" for test in tests]
+        predictions = [[code]] * len(references)
+        _, results_dict = code_eval.compute(
+            references=references, predictions=predictions,
+            k=[1], num_workers=1, timeout=3.0,
+        )
+        passed = sum(
+            1 for task_results in results_dict.values()
+            for _, r in task_results if r["passed"]
+        )
         scores.append(passed / len(tests))
     return scores
 
@@ -56,17 +53,12 @@ def mbpp_exec_reward(completions: list[str], test_list: list,
 # ── Memory callback ──────────────────────────────────────────────────────────
 
 class MemoryCallback(TrainerCallback):
-    """Track peak GPU VRAM via nvidia-smi (same approach as eval/ablations.py)."""
-
     def __init__(self):
         self.peak_vram_mb = 0.0
 
     def on_step_end(self, args, state, control, **kwargs):
-        nvsmi = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True,
-        )
-        used_mb = float(nvsmi.stdout.strip().split("\n")[0])
+        free, total = torch.cuda.mem_get_info()
+        used_mb = (total - free) / (1024 ** 2)
         self.peak_vram_mb = max(self.peak_vram_mb, used_mb)
 
 
@@ -82,15 +74,17 @@ def main() -> None:
     parser.add_argument("--total-steps", type=int, default=1000)
     parser.add_argument("--n-samples", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--dsmezo-results", type=Path, required=True,
+                        help="Path to DS-MeZO rl_bench_results.json for comparison")
     args = parser.parse_args()
 
     model_name = args.model_path.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config
-    adapter_config = json.loads((args.adapter_path / "adapter_config.json").read_text())
-    rank = adapter_config["r"]
-    target_modules = adapter_config["target_modules"]
+    # Read rank and target modules from adapter config via PEFT
+    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
+    rank = peft_config.r
+    target_modules = list(peft_config.target_modules)
 
     # Load training data (same as DS-MeZO)
     train_data = load_mbpp_train()
@@ -107,10 +101,11 @@ def main() -> None:
     # Evaluate PiSSA init weights via vLLM (identical to DS-MeZO's pre-eval)
     print("\nLoading vLLM engine for pre-training eval...")
     t0 = time.time()
+
     eval_engine = LLM(
         model=str(args.model_path),
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
@@ -121,14 +116,13 @@ def main() -> None:
     pre_mbpp = eval_mbpp(eval_engine, lora_request=lora_req,
                          n_samples=args.n_samples, temperature=args.temperature)
     print(f"\n--- Pre-training baseline ---")
-    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} ({pre_mbpp['num_tasks']} tasks)")
-    if "pass@10" in pre_mbpp:
-        print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%}")
+    ci = pre_mbpp['pass@1_ci95']
+    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {pre_mbpp['num_tasks']} tasks)")
+    ci10 = pre_mbpp['pass@10_ci95']
+    print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
 
-    del eval_engine
     torch.cuda.empty_cache()
 
-    # ── GRPO Training ────────────────────────────────────────────────────
     print("\nLoading model for GRPO training...")
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_path))
     base_model = AutoModelForCausalLM.from_pretrained(
@@ -136,7 +130,6 @@ def main() -> None:
     )
     model = PeftModel.from_pretrained(base_model, str(args.adapter_path))
 
-    # All GRPO-specific hyperparameters use TRL defaults
     training_args = GRPOConfig(
         output_dir=str(args.output_dir / "grpo_checkpoints"),
         use_vllm=True,
@@ -166,12 +159,8 @@ def main() -> None:
         callbacks=[mem_callback],
     )
 
-    # Memory baseline before training
-    nvsmi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True,
-    )
-    mem_before_gb = float(nvsmi.stdout.strip().split("\n")[0]) / 1024
+    free, total = torch.cuda.mem_get_info()
+    mem_before_gb = (total - free) / (1024 ** 3)
 
     print(f"\n--- Training ({args.total_steps} steps) ---")
     t_start = time.time()
@@ -183,18 +172,16 @@ def main() -> None:
     print(f"  VRAM before training: {mem_before_gb:.1f} GB")
     print(f"  Peak VRAM:            {peak_vram_gb:.1f} GB")
 
-    # ── Post-training evaluation ─────────────────────────────────────────
-    # Save trained adapter, free GPU, reload via vLLM
     adapter_save_path = args.output_dir / "trained_adapter"
     trainer.model.save_pretrained(str(adapter_save_path))
-    del trainer, model, base_model
     torch.cuda.empty_cache()
 
     print("\nLoading vLLM engine for post-training eval...")
+
     eval_engine = LLM(
         model=str(args.model_path),
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
@@ -204,30 +191,18 @@ def main() -> None:
                           n_samples=args.n_samples, temperature=args.temperature)
 
     print(f"\n--- Post-training evaluation ---")
-    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} ({post_mbpp['num_tasks']} tasks)")
-    if "pass@10" in post_mbpp:
-        print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%}")
+    ci = post_mbpp['pass@1_ci95']
+    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {post_mbpp['num_tasks']} tasks)")
+    ci10 = post_mbpp['pass@10_ci95']
+    print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
 
-    del eval_engine
-
-    # ── Results ──────────────────────────────────────────────────────────
     delta_1 = post_mbpp["pass@1"] - pre_mbpp["pass@1"]
 
-    print("\n" + "=" * 70)
-    print("GRPO RESULTS")
-    print("=" * 70)
-    print(f"  MBPP pass@1 pre:    {pre_mbpp['pass@1']:.1%}")
-    print(f"  MBPP pass@1 post:   {post_mbpp['pass@1']:.1%}")
-    print(f"  Delta pass@1:       {delta_1:+.1%}")
-    if "pass@10" in pre_mbpp and "pass@10" in post_mbpp:
-        delta_10 = post_mbpp["pass@10"] - pre_mbpp["pass@10"]
-        print(f"  MBPP pass@10 pre:   {pre_mbpp['pass@10']:.1%}")
-        print(f"  MBPP pass@10 post:  {post_mbpp['pass@10']:.1%}")
-        print(f"  Delta pass@10:      {delta_10:+.1%}")
-    print(f"  Peak VRAM:          {peak_vram_gb:.1f} GB")
-    print(f"  Training time:      {train_time:.1f}s ({train_time/args.total_steps:.1f}s/step)")
+    delta_10 = post_mbpp["pass@10"] - pre_mbpp["pass@10"]
+    print(f"\n  pass@1: {pre_mbpp['pass@1']:.1%} → {post_mbpp['pass@1']:.1%} ({delta_1:+.1%})")
+    print(f"  pass@10: {pre_mbpp['pass@10']:.1%} → {post_mbpp['pass@10']:.1%} ({delta_10:+.1%})")
+    print(f"  VRAM: {peak_vram_gb:.1f} GB | Time: {train_time:.1f}s")
 
-    # Save results
     results = {
         "method": "grpo",
         "model": model_name,
@@ -247,29 +222,24 @@ def main() -> None:
         json.dump(results, f, indent=2, default=str)
     print(f"  Results saved to {results_path}")
 
-    # ── Comparison with DS-MeZO (if results exist) ──────────────────────
-    dsmezo_path = args.output_dir.parent / "rl_bench_results.json"
-    if not dsmezo_path.exists():
-        dsmezo_path = args.output_dir.parent / "dsmezo" / "rl_bench_results.json"
-    if dsmezo_path.exists():
-        dsmezo = json.loads(dsmezo_path.read_text())
-        print("\n" + "=" * 70)
-        print("COMPARATIVE RESULTS: DS-MeZO vs GRPO")
-        print("=" * 70)
-        print(f"{'Method':<20} | {'pass@1 pre':>10} | {'pass@1 post':>11} | "
-              f"{'Delta':>7} | {'Time':>7} | {'Peak VRAM':>9}")
-        print("-" * 78)
-        # DS-MeZO row
-        dz_pre = dsmezo["pre_mbpp"]["pass@1"]
-        dz_post = dsmezo["post_mbpp"]["pass@1"]
-        dz_delta = dsmezo["delta_pass@1"]
-        dz_time = dsmezo["train_time"]
-        print(f"{'DS-MeZO (ZO)':<20} | {dz_pre:>9.1%} | {dz_post:>10.1%} | "
-              f"{dz_delta:>+6.1%} | {dz_time:>6.0f}s | {'~17 GB':>9}")
-        # GRPO row
-        print(f"{'GRPO (backprop)':<20} | {pre_mbpp['pass@1']:>9.1%} | "
-              f"{post_mbpp['pass@1']:>10.1%} | {delta_1:>+6.1%} | "
-              f"{train_time:>6.0f}s | {peak_vram_gb:>7.1f} GB")
+    dsmezo = json.loads(args.dsmezo_results.read_text())
+    print("\n" + "=" * 70)
+    print("COMPARATIVE RESULTS: DS-MeZO vs GRPO")
+    print("=" * 70)
+    print(f"{'Method':<20} | {'pass@1 pre':>10} | {'pass@1 post':>11} | "
+          f"{'Delta':>7} | {'Time':>7} | {'Peak VRAM':>9}")
+    print("-" * 78)
+    # DS-MeZO row
+    dz_pre = dsmezo["pre_mbpp"]["pass@1"]
+    dz_post = dsmezo["post_mbpp"]["pass@1"]
+    dz_delta = dsmezo["delta_pass@1"]
+    dz_time = dsmezo["train_time"]
+    print(f"{'DS-MeZO (ZO)':<20} | {dz_pre:>9.1%} | {dz_post:>10.1%} | "
+          f"{dz_delta:>+6.1%} | {dz_time:>6.0f}s | {'~17 GB':>9}")
+    # GRPO row
+    print(f"{'GRPO (backprop)':<20} | {pre_mbpp['pass@1']:>9.1%} | "
+          f"{post_mbpp['pass@1']:>10.1%} | {delta_1:>+6.1%} | "
+          f"{train_time:>6.0f}s | {peak_vram_gb:>7.1f} GB")
 
 
 if __name__ == "__main__":

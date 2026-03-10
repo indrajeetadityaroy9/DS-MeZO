@@ -26,8 +26,8 @@ python -m eval.rl_bench_eval --model-path <path> --adapter-path <path> --output-
 python -m eval.sft_eval --model-path <path> --adapter-path <path> --output-dir <path>
 python -m eval.ablations --model-path <path> --adapter-path <path> --output-dir <path>
 
-# GRPO baseline (requires: pip install -e ".[baselines]")
-python -m eval.grpo_baseline --model-path <path> --adapter-path <path> --output-dir <path>
+# GRPO baseline (all dependencies in core install)
+python -m eval.grpo_baseline --model-path <path> --adapter-path <path> --output-dir <path> --dsmezo-results <path>
 ```
 
 Entry points are also available via `pyproject.toml`: `ds-mezo-train` (→ `scripts.train:main`) and `ds-mezo-pissa` (→ `scripts.prepare_pissa:main`).
@@ -54,20 +54,20 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Core modules (`ds_mezo/`)
 
-- **`controller.py`** — Unified training loop. Single `step()` handles both SFT and RL via `hybrid_switch_step`. Config via `_CONFIG_DEFAULTS` dict with `config.get()`. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports.
+- **`controller.py`** — Unified training loop. Single `step()` handles both SFT and RL via `hybrid_switch_step`. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR`, `optht`, and `torch.optim.Muon` N-S coefficients.
 - **`backend.py`** — vLLM isolation layer. Handles adapter serialization (PEFT format), generation, prefill-only logprob scoring, and activation extraction via forward hooks. All vLLM-specific code lives here.
-- **`kernels.py`** — Four Hopper-native Triton kernels: `zo_muon_update` (fused gradient + momentum + 5-iteration Newton-Schulz + param update, dispatches tall vs wide), `fused_power_iter` (fused H.T@H@V + QR for activation subspace tracking), `fused_agzo_perturbation` (fused AGZO perturbation: z_B projection + B@V + in-register QR + z_A projection, eliminates cuSOLVER overhead), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one pass). Requires adapter rank >= 16 (`tl.dot` 16-wide HMMA requirement on Hopper). Uses raw pointer arithmetic only — no block pointers or experimental APIs (Triton 3.6 stability constraint).
+- **`kernels.py`** — Four Hopper-native Triton kernels: `zo_muon_update` (fused gradient + momentum + Newton-Schulz + param update, dispatches tall vs wide; `NS_ITERS` and `NORM_FLOOR` are constexpr params derived from dtype), `fused_power_iter` (fused H.T@H@V + QR for activation subspace tracking; `NORM_FLOOR` constexpr), `fused_agzo_perturbation` (fused AGZO perturbation: z_B projection + B@V + in-register QR + z_A projection; `NORM_FLOOR` constexpr), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one pass). Requires adapter rank >= 16 (`tl.dot` 16-wide HMMA requirement on Hopper). Uses raw pointer arithmetic only — no block pointers or experimental APIs (Triton 3.6 stability constraint).
 - **`model_config.py`** — Model-agnostic layer discovery via `torch.device("meta")` introspection (zero memory — no weights loaded). Returns `LayerSpec` dataclass with PEFT naming conventions.
 - **`__init__.py`** — Public API exports: `DSMeZO_Controller`, `VLLMBackend`, `LayerSpec`, `discover_layers`.
 
 ### Eval modules (`eval/`)
 
-- **`benchmarks.py`** — Standard benchmark implementations: `eval_perplexity()`, `eval_gsm8k()` (8-shot CoT), `eval_mbpp()` (zero-shot), `eval_humaneval()`.
-- **`utils.py`** — Shared utilities: `extract_code()` (parses code blocks from LLM output), `pass_at_k()` (unbiased estimator), `make_exec_reward()` (closure factory returning `(reward_fn, set_problem_fn)`).
+- **`benchmarks.py`** — Standard benchmark implementations: `eval_perplexity()`, `eval_gsm8k()` (8-shot CoT), `eval_mbpp()` (zero-shot).
+- **`utils.py`** — Shared utilities: `extract_code()` (parses code blocks from LLM output), `make_exec_reward()` (closure factory returning `(reward_fn, set_problem_fn)`).
 - **`rl_bench_eval.py`** — RL proof-of-concept on MBPP: trains then evaluates.
 - **`sft_eval.py`** — SFT evaluation on GSM8K with perplexity metric.
 - **`ablations.py`** — 4 controlled component ablation experiments via `run_experiment()`.
-- **`grpo_baseline.py`** — GRPO backprop baseline via TRL GRPOTrainer. Same PiSSA init as DS-MeZO for controlled comparison. Requires `pip install -e ".[baselines]"`.
+- **`grpo_baseline.py`** — GRPO backprop baseline via TRL GRPOTrainer. Same PiSSA init as DS-MeZO for controlled comparison. Requires `--dsmezo-results` path to DS-MeZO results JSON.
 
 ### Key conventions
 
@@ -75,7 +75,7 @@ Controller (controller.py)          Backend (backend.py)
 - **vLLM module merges**: vLLM fuses `q_proj`/`k_proj`/`v_proj` → `qkv_proj` and `gate_proj`/`up_proj` → `gate_up_proj`. The backend's `hook_map` handles this translation for activation capture.
 - **Adapter staging**: Adapters serialize to a configurable `staging_dir` (default `/dev/shm/ds_mezo/`, tmpfs) for zero-copy vLLM loading. Two adapter slots: `adapter_pos` (θ+ε) and `adapter_neg` (θ-ε) for SPSA. Staging is ephemeral; persistent artifacts go to `output_dir`.
 - **Directory convention** (HuggingFace standard): `output_dir` is the single root for all persistent artifacts (checkpoints under `{output_dir}/checkpoints/`, eval results as `{output_dir}/*.json`). `staging_dir` is ephemeral (tmpfs) for vLLM adapter hot-swap. All paths are required CLI arguments — no hardcoded defaults.
-- **Config as plain dict**: `DSMeZO_Controller` init takes a `dict[str, Any]`. Defaults are in `_CONFIG_DEFAULTS` module-level dict; unknown keys are silently ignored via `config.get(key, default)`.
+- **Config as plain dict**: `DSMeZO_Controller` init takes a `dict[str, Any]`. Caller config merged over `_CONFIG_DEFAULTS` via `{**defaults, **config}`.
 
 ### Config fields (config YAML surface)
 
@@ -89,12 +89,17 @@ Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"
 | `seed` | 42 | RNG seed for reproducibility |
 | `score_fn` | None | Custom reward callable (code sets this programmatically) |
 
-Self-adaptive parameters (not configurable):
-- **LR**: Self-calibrating `eps/dd_ema * cosine` (Spall 1998 §7: optimal a ~ c²). Scale-invariant.
-- **Momentum**: Self-adaptive `1 - _ema_alpha()` (VA-Muon complement). Ramps from 0 to 1-1/√total_steps.
-- **num_candidates**: 4 (RLOO canonical — Ahmadian et al. 2024). Protocol constant.
+Self-adaptive parameters (all derived from model/dtype at init — no manual tuning):
+- **Epsilon**: `median(‖W‖_F) * eps_machine^(1/3)` (Numerical Recipes §5.7). Scale-invariant.
+- **LR**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes update unit-spectral-norm; trust-region: step ≤ perturbation radius.
+- **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
+- **r_calib**: Gavish-Donoho optimal singular value threshold via `optht` library (Marchenko-Pastur, determined once at calibration).
+- **N-S iterations**: 3-term scalar simulation for `s_min = 1/sqrt(rank)` — derived from adapter rank and FP32 precision. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
+- **Power iter steps**: `ceil(log(log(1/eps_dtype)/log(2))/log(3))` — warm-started convergence from FP32 precision.
+- **SVD power iters**: Same warm-start formula — derived from FP32 precision (replaces Halko niter=2 default).
+- **Norm floor**: `torch.finfo(torch.float32).tiny` — dtype-derived.
+- **num_candidates**: 4 (RLOO practical default — Ahmadian et al. 2024, TRL default).
 - **Temperature**: Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
-- **Epsilon**: `1e-3/√rank` (SPSA theory — Spall 1998). Derived from adapter rank.
 
 ### Training flow
 
@@ -107,17 +112,18 @@ Self-adaptive parameters (not configurable):
 3. **AGZO perturbation**: Project random vectors into activation subspace for B; into B's column space for A
 4. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
 5. **Contrastive scoring**: Score winner/loser trajectories under θ+ and θ-
-6. **ZClip**: Reciprocal z-score clipping on directional derivative (z_thres=2.5, z*=z_thres²/z per 2504.02507 Algorithm 1)
-7. **ZO-Muon update**: Fused kernel applies SPSA gradient → self-adaptive momentum (1-α) → Newton-Schulz orthogonalization → parameter update
-8. **Schedule**: Self-calibrating LR (eps/dd_ema * cosine), cosine temperature decay to 0
+6. **ZO-Muon update**: Fused kernel applies SPSA gradient → adaptive momentum → 3-term Newton-Schulz orthogonalization (canonical Muon) → parameter update
+7. **Schedule**: Cosine LR (eta_max = eps → 0), cosine temperature decay to 0
 
 ## Environment
 
 - Requires NVIDIA GPU (H100 target, any CUDA GPU for tests)
 - Python 3.12+, PyTorch 2.10, Triton 3.6, vLLM 0.17.0
-- Pinned deps: `safetensors==0.7.0`, `transformers==4.56.0`, `datasets==3.5.0`, `evaluate==0.4.3`, `PyYAML==6.0.1`
+- Pinned deps: `safetensors==0.7.0`, `transformers==4.56.0`, `datasets==3.5.0`, `evaluate==0.4.3`, `PyYAML==6.0.1`, `optht>=0.2.0`
 - `VLLM_ALLOW_INSECURE_SERIALIZATION=1` required (set by caller — see `scripts/launch.sh`)
-- `launch.sh` locks GPU clocks (`nvidia-smi -lgc 1980,1980 && nvidia-smi -lmc 2619`), sets `OMP_NUM_THREADS=16`, `MKL_NUM_THREADS=16`, `TOKENIZERS_PARALLELISM=true`, disables TF imports
+- `launch.sh` auto-detects max GPU clocks via `nvidia-smi --query-supported-clocks`, sets `OMP_NUM_THREADS` from `os.cpu_count()`, `TOKENIZERS_PARALLELISM=true`
+- vLLM `gpu_memory_utilization=0.95` hardcoded across all instantiation sites (no dynamic `mem_get_info()` calculation)
+- Activation CPU→GPU transfers use pinned memory with non-blocking DMA
 - Config files use YAML; `model_path`, `adapter_path`, and `output_dir` are required, all else defaults from `_CONFIG_DEFAULTS`
 
 ## Common pitfalls

@@ -1,12 +1,12 @@
 """Triton kernels for DS-MeZO — Hopper-native (sm_90).
 
 Kernel 1: zo_muon_update — fuses gradient computation, momentum accumulation,
-    Newton-Schulz orthogonalization (5 iter), and parameter update into a
-    single kernel launch per matrix. Saves ~2500 kernel launches per step
-    vs unfused PyTorch. Mechanism-critical: this IS the ZO-Muon optimizer.
+    Newton-Schulz orthogonalization (NS_ITERS, derived from rank and dtype), and parameter
+    update into a single kernel launch per matrix. Saves ~2500 kernel launches
+    per step vs unfused PyTorch. Mechanism-critical: this IS the ZO-Muon optimizer.
 
 Kernel 2: fused_power_iter — warm-started power iteration for activation
-    subspace tracking. Fuses 3×(H.T@H@V + QR) = 9 launches → 1 per layer.
+    subspace tracking. Fuses num_iters×(H.T@H@V + QR) launches → 1 per layer.
     Saves ~1000 kernel launches per step. Avoids ~55MB intermediate allocations.
     Mechanism-critical: this IS the AGZO activation subspace tracker.
 
@@ -25,8 +25,8 @@ H100 architecture notes:
   - Adapter matrices are A:(d_out×r), B:(r×d_in) with r=16 typically.
     N-S inner products are 16×16 — below the 16-wide minimum for TF32 HMMA
     to provide speedup. FP32 CUDA cores are used, which is correct for
-    N-S convergence anyway (cubic convergence requires full FP32 precision).
-  - Power iteration R=rank/2≈8 — too narrow for Tensor Cores.
+    N-S convergence anyway (full FP32 precision needed for convergence).
+  - Power iteration R=r_calib (Gavish-Donoho threshold derived) — too narrow for Tensor Cores.
   - tl.dot constraint: contraction dimension K >= 16.
   - Adapter rank >= 16 required: N-S inner products are rank×rank, and tl.dot
     requires contraction dimension >= 16 for Hopper mma.sync instructions.
@@ -41,10 +41,12 @@ H100 architecture notes:
     primitives: tl.load, tl.store, tl.dot, tl.trans, tl.static_range.
 
 Invariant constants (mathematically fixed, not tunable):
-  - Newton-Schulz: X_{k+1} = 0.5 * X_k @ (3I - X_k.T @ X_k)
-    3.0 and 0.5 are exact Padé coefficients for matrix sign function.
-  - 5 iterations: cubic convergence → error ∝ ε₀^243 ≈ 0 for ε₀ < 0.5.
-  - 1e-16 norm floor: below FP32 machine epsilon (1.19e-7).
+  - Newton-Schulz 3-term: X_{k+1} = X_k @ (aI + bG + cG²), G = X_k.T @ X_k
+    (a, b, c) = (3.4445, -4.7750, 2.0315) — optimal degree-5 polynomial for
+    matrix sign approximation on [0,1] (canonical Muon, PyTorch torch.optim.Muon).
+  - N-S iteration count derived from adapter rank and dtype precision (scalar 3-term
+    simulation for worst-case s_min = 1/sqrt(rank)). Norm floor = finfo.tiny.
+    Both derived by the controller and passed as constexpr parameters.
   - BLOCK_M=128, BLOCK_N=128: power-of-2 tile sizes for H100 SRAM alignment.
     BLOCK_T=128 for token-dimension tiling in power iteration.
 
@@ -67,7 +69,7 @@ import triton.language as tl
 
 # ── Kernel 1: Fused ZO-Muon update ────────────────────────────────────────
 # Fuses: SPSA gradient → momentum → Frobenius normalize →
-# 5× Newton-Schulz orthogonalization → parameter update.
+# N-S orthogonalization → parameter update.
 # Single kernel launch per adapter matrix (vs ~21 PyTorch ops unfused).
 
 @triton.jit
@@ -77,9 +79,11 @@ def _zo_muon_tall_kernel(
     stride_m, stride_n,
     dd, momentum, eta,
     BLOCK_M: tl.constexpr,
+    NS_ITERS: tl.constexpr,
+    NORM_FLOOR: tl.constexpr,
 ):
     """ZO-Muon for tall matrices (M >= N). Tiles along M rows.
-    N-S form: X = 0.5 * X @ (3I_N - X.T @ X). Inner product is (N, N)."""
+    N-S 3-term: X = X @ (aI + bG + cG²), G = X.T@X. Inner product is (N, N)."""
 
     offs_n = tl.arange(0, N)
     num_chunks = tl.cdiv(M, BLOCK_M)
@@ -101,7 +105,7 @@ def _zo_muon_tall_kernel(
         tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
         norm_sq += tl.sum(buf_tile * buf_tile)
 
-    inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, 1e-16))
+    inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, NORM_FLOOR))
 
     # Pass 2: Normalize buf → scratch (X₀ = buf / ‖buf‖_F)
     for chunk in range(num_chunks):
@@ -112,9 +116,9 @@ def _zo_muon_tall_kernel(
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
         tl.store(scratch_ptr + ptrs, buf_tile * inv_norm, mask=mask)
 
-    # Passes 3-7: 5 Newton-Schulz iterations (in-place on scratch)
+    # Newton-Schulz iterations (in-place on scratch)
     # Phase A reads all tiles, then Phase B overwrites. No data hazard.
-    for ns_iter in tl.static_range(5):
+    for ns_iter in tl.static_range(NS_ITERS):
         XtX = tl.zeros([N, N], dtype=tl.float32)
         for chunk in range(num_chunks):
             m_start = chunk * BLOCK_M
@@ -126,7 +130,8 @@ def _zo_muon_tall_kernel(
 
         eye_n = tl.arange(0, N)
         I_N = (eye_n[:, None] == eye_n[None, :]).to(tl.float32)
-        S = 3.0 * I_N - XtX
+        G2 = tl.dot(XtX, XtX, allow_tf32=False)
+        S = 3.4445 * I_N + (-4.7750) * XtX + 2.0315 * G2
 
         for chunk in range(num_chunks):
             m_start = chunk * BLOCK_M
@@ -134,10 +139,10 @@ def _zo_muon_tall_kernel(
             mask_2d = offs_m[:, None] < M
             ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
             X_tile = tl.load(scratch_ptr + ptrs, mask=mask_2d, other=0.0)
-            X_new = 0.5 * tl.dot(X_tile, S, allow_tf32=False)
+            X_new = tl.dot(X_tile, S, allow_tf32=False)
             tl.store(scratch_ptr + ptrs, X_new, mask=mask_2d)
 
-    # Pass 8: param -= eta * X_final
+    # Final pass: param -= eta * X_final
     for chunk in range(num_chunks):
         m_start = chunk * BLOCK_M
         offs_m = m_start + tl.arange(0, BLOCK_M)
@@ -155,9 +160,11 @@ def _zo_muon_wide_kernel(
     stride_m, stride_n,
     dd, momentum, eta,
     BLOCK_N: tl.constexpr,
+    NS_ITERS: tl.constexpr,
+    NORM_FLOOR: tl.constexpr,
 ):
     """ZO-Muon for wide matrices (M < N). Tiles along N columns.
-    N-S form: X = 0.5 * (3I_M - X @ X.T) @ X. Inner product is (M, M)."""
+    N-S 3-term: X = (aI + bG + cG²) @ X, G = X@X.T. Inner product is (M, M)."""
 
     offs_m = tl.arange(0, M)
     num_chunks = tl.cdiv(N, BLOCK_N)
@@ -179,7 +186,7 @@ def _zo_muon_wide_kernel(
         tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
         norm_sq += tl.sum(buf_tile * buf_tile)
 
-    inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, 1e-16))
+    inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, NORM_FLOOR))
 
     # Pass 2: Normalize buf → scratch
     for chunk in range(num_chunks):
@@ -190,8 +197,8 @@ def _zo_muon_wide_kernel(
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
         tl.store(scratch_ptr + ptrs, buf_tile * inv_norm, mask=mask)
 
-    # Passes 3-7: 5 Newton-Schulz iterations (in-place on scratch)
-    for ns_iter in tl.static_range(5):
+    # Newton-Schulz iterations (in-place on scratch)
+    for ns_iter in tl.static_range(NS_ITERS):
         XXt = tl.zeros([M, M], dtype=tl.float32)
         for chunk in range(num_chunks):
             n_start = chunk * BLOCK_N
@@ -203,7 +210,8 @@ def _zo_muon_wide_kernel(
 
         eye_m = tl.arange(0, M)
         I_M = (eye_m[:, None] == eye_m[None, :]).to(tl.float32)
-        S = 3.0 * I_M - XXt
+        G2 = tl.dot(XXt, XXt, allow_tf32=False)
+        S = 3.4445 * I_M + (-4.7750) * XXt + 2.0315 * G2
 
         for chunk in range(num_chunks):
             n_start = chunk * BLOCK_N
@@ -211,10 +219,10 @@ def _zo_muon_wide_kernel(
             mask = offs_n[None, :] < N
             ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
             X_tile = tl.load(scratch_ptr + ptrs, mask=mask, other=0.0)
-            X_new = 0.5 * tl.dot(S, X_tile, allow_tf32=False)
+            X_new = tl.dot(S, X_tile, allow_tf32=False)
             tl.store(scratch_ptr + ptrs, X_new, mask=mask)
 
-    # Pass 8: param -= eta * X_final
+    # Final pass: param -= eta * X_final
     for chunk in range(num_chunks):
         n_start = chunk * BLOCK_N
         offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -233,6 +241,8 @@ def zo_muon_update(
     dd: float,
     momentum: float,
     eta: float,
+    ns_iters: int,
+    norm_floor: float,
 ) -> None:
     """Fused ZO-Muon update: grad → momentum → Newton-Schulz → param update.
 
@@ -247,6 +257,7 @@ def zo_muon_update(
             stride_m=param.stride(0), stride_n=param.stride(1),
             dd=dd, momentum=momentum, eta=eta,
             BLOCK_M=128,
+            NS_ITERS=ns_iters, NORM_FLOOR=norm_floor,
         )
     else:
         _zo_muon_wide_kernel[(1,)](
@@ -255,6 +266,7 @@ def zo_muon_update(
             stride_m=param.stride(0), stride_n=param.stride(1),
             dd=dd, momentum=momentum, eta=eta,
             BLOCK_N=128,
+            NS_ITERS=ns_iters, NORM_FLOOR=norm_floor,
         )
 
 
@@ -273,6 +285,7 @@ def _power_iter_kernel(
     stride_od, stride_or,
     num_iters: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    NORM_FLOOR: tl.constexpr,
 ):
     """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
 
@@ -319,7 +332,7 @@ def _power_iter_kernel(
                 q_prev = tl.sum(V * prev_mask[None, :], axis=1)
                 dot_val = tl.sum(v_col * q_prev)
                 v_col = v_col - dot_val * q_prev
-            norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), 1e-16))
+            norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), NORM_FLOOR))
             v_col = v_col / norm
             V = V * (1.0 - col_mask[None, :]) + v_col[:, None] * col_mask[None, :]
 
@@ -333,7 +346,8 @@ def _power_iter_kernel(
 def fused_power_iter(
     H: torch.Tensor,
     V: torch.Tensor,
-    num_iters: int = 3,
+    num_iters: int,
+    norm_floor: float,
 ) -> torch.Tensor:
     """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
 
@@ -353,6 +367,7 @@ def fused_power_iter(
         stride_od=out.stride(0), stride_or=out.stride(1),
         num_iters=num_iters,
         BLOCK_T=128,
+        NORM_FLOOR=norm_floor,
     )
     return out
 
@@ -375,6 +390,7 @@ def _agzo_perturb_kernel(
     stride_zb_r, stride_zb_din,
     eps,
     BLOCK_D: tl.constexpr,
+    NORM_FLOOR: tl.constexpr,
 ):
     """Fused AGZO perturbation for one adapter layer.
 
@@ -446,7 +462,7 @@ def _agzo_perturb_kernel(
             q_prev = tl.sum(Q * prev_mask[None, :], axis=1)
             dot_val = tl.sum(v_col * q_prev)
             v_col = v_col - dot_val * q_prev
-        norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), 1e-16))
+        norm = tl.sqrt(tl.maximum(tl.sum(v_col * v_col), NORM_FLOOR))
         v_col = v_col / norm
         Q = Q * (1.0 - col_mask[None, :]) + v_col[:, None] * col_mask[None, :]
 
@@ -488,6 +504,7 @@ def fused_agzo_perturbation(
     z_coeff_B: torch.Tensor,
     z_coeff_A: torch.Tensor,
     eps: float,
+    norm_floor: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused AGZO perturbation: compute z_A and z_B in a single kernel.
 
@@ -517,6 +534,7 @@ def fused_agzo_perturbation(
         stride_zb_r=z_B.stride(0), stride_zb_din=z_B.stride(1),
         eps=eps,
         BLOCK_D=128,
+        NORM_FLOOR=norm_floor,
     )
     return z_A, z_B
 

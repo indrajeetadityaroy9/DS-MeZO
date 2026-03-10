@@ -1,3 +1,4 @@
 model_path: /dev/shm/pissa_prep/residual
 adapter_path: /dev/shm/pissa_prep/adapter
+output_dir: output
 total_steps: 10

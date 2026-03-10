@@ -1,13 +1,4 @@
-"""DS-MeZO SFT evaluation: train on GSM8K, evaluate via perplexity.
-
-Pure SFT mode: uses the unified step pipeline (AGZO + ZO-Muon) with NLL loss.
-hybrid_switch_step = total_steps ensures no RL exploration.
-
-Primary metric: perplexity on held-out GSM8K samples (direct NLL measurement).
-Secondary metric: GSM8K exact-match (only meaningful for larger models).
-
-Usage: python -m eval.sft_eval --model-path <path> --adapter-path <path>
-"""
+"""DS-MeZO SFT evaluation: train on GSM8K, evaluate via perplexity and exact match."""
 
 from __future__ import annotations
 
@@ -16,7 +7,9 @@ import json
 import time
 from pathlib import Path
 
+import torch
 from datasets import load_dataset
+from peft import PeftConfig
 from transformers import AutoTokenizer
 from vllm import LLM
 
@@ -31,11 +24,6 @@ def prepare_sft_data(
     max_seq_len: int,
     held_out_samples: int,
 ) -> tuple[list[dict], list[dict]]:
-    """Load and tokenize GSM8K train split for SFT.
-
-    Returns (train_data, held_out_data) where held_out is used for
-    perplexity evaluation.
-    """
     dataset = load_dataset("openai/gsm8k", "main", split="train")
 
     all_data = []
@@ -45,7 +33,7 @@ def prepare_sft_data(
         full_text = prompt + completion
         full_ids = tokenizer.encode(full_text, add_special_tokens=True)[:max_seq_len]
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
-        prompt_len = min(len(prompt_ids), len(full_ids) - 1)
+        prompt_len = len(prompt_ids)
         all_data.append({
             "token_ids": full_ids,
             "prompt_len": prompt_len,
@@ -71,10 +59,9 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config
-    adapter_config = json.loads((args.adapter_path / "adapter_config.json").read_text())
-    rank = adapter_config["r"]
-    target_modules = adapter_config["target_modules"]
+    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
+    rank = peft_config.r
+    target_modules = list(peft_config.target_modules)
 
     print("=" * 70)
     print("DS-MeZO SFT EVALUATION: GSM8K")
@@ -82,47 +69,33 @@ def main() -> None:
     print(f"Steps: {args.total_steps} | Max seq len: {args.max_seq_len}")
     print("=" * 70)
 
-    # Load tokenizer and prepare data
-    print("\nPreparing SFT data...")
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_path))
     train_data, held_out = prepare_sft_data(
         tokenizer, args.max_seq_len, args.held_out_samples,
     )
-    print(f"Training samples: {len(train_data)}")
-    print(f"Held-out samples: {len(held_out)}")
-    avg_seq = sum(len(s['token_ids']) for s in train_data) / len(train_data)
-    avg_comp = sum(len(s['token_ids']) - s['prompt_len'] for s in train_data) / len(train_data)
-    print(f"Avg sequence length: {avg_seq:.0f}")
-    print(f"Avg completion length: {avg_comp:.0f}")
 
-    # Load vLLM engine
     print("\nLoading vLLM engine...")
     t0 = time.time()
     llm = LLM(
         model=str(args.model_path),
         dtype="bfloat16",
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.95,
         enable_lora=True,
         max_lora_rank=max(64, rank),
         enforce_eager=True,
     )
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
-    # Initialize controller in pure SFT mode (hybrid_switch_step = total_steps)
-    print("Initializing controller (pure SFT)...")
     layer_specs = discover_layers(args.model_path, target_modules)
     backend = VLLMBackend(llm, layer_specs, rank)
     controller = DSMeZO_Controller(backend, layer_specs, {
         "output_dir": str(args.output_dir),
         "adapter_path": str(args.adapter_path),
-        "model_path": str(args.model_path),
         "total_steps": args.total_steps,
-        "hybrid_switch_step": args.total_steps,  # Pure SFT: never switch to RL
+        "hybrid_switch_step": args.total_steps,
     })
     controller._calibrate_activation_bases_full([train_data[0]["prompt_text"]])
-    print(f"Layers: {len(controller.layers)} | hybrid_switch_step: {controller.hybrid_switch_step}")
 
-    # Held-out data for perplexity eval
     held_out_ids = [s["token_ids"] for s in held_out]
     held_out_plens = [s["prompt_len"] for s in held_out]
 
@@ -131,12 +104,16 @@ def main() -> None:
     controller.backend.sync_adapters({}, {}, controller.layers)
     baseline_ppl = eval_perplexity(llm, held_out_ids, held_out_plens,
                                    lora_request=backend.lora_pos)
+    ppl_ci = baseline_ppl['perplexity_ci95']
     print(f"  Held-out perplexity: {baseline_ppl['perplexity']:.2f} "
-          f"(NLL: {baseline_ppl['avg_nll']:.4f}, {baseline_ppl['total_tokens']} tokens)")
+          f"(95% CI: {ppl_ci[0]:.2f}–{ppl_ci[1]:.2f}, "
+          f"{baseline_ppl['total_tokens']} tokens)")
 
     baseline_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos)
+    em_ci = baseline_gsm8k['exact_match_ci95']
     print(f"  GSM8K exact_match:   {baseline_gsm8k['exact_match']:.1%} "
-          f"({baseline_gsm8k['num_parsed']}/{baseline_gsm8k['num_samples']} parsed)")
+          f"(95% CI: {em_ci[0]:.1%}–{em_ci[1]:.1%}, "
+          f"{baseline_gsm8k['num_parsed']}/{baseline_gsm8k['num_samples']} parsed)")
 
     # Train
     print(f"\n--- SFT Training ({args.total_steps} steps) ---")
@@ -149,22 +126,13 @@ def main() -> None:
 
         entry = {
             "step": step_idx + 1,
-            "dd_ema": controller.dd_ema,
             "eta": controller.eta,
             "eps": controller.eps,
         }
         log.append(entry)
 
         if (step_idx + 1) % 200 == 0:
-            elapsed = time.time() - t_start
-            s_per_step = elapsed / (step_idx + 1)
-            eta_remain = s_per_step * (args.total_steps - step_idx - 1)
-            dd_str = f"{controller.dd_ema:.4f}"
-            print(f"  step {step_idx+1:4d}/{args.total_steps} | "
-                  f"dd_ema={dd_str} | "
-                  f"lr={controller.eta:.2e} | "
-                  f"{s_per_step:.1f}s/step | "
-                  f"ETA {eta_remain:.0f}s")
+            print(f"  step {step_idx+1}/{args.total_steps} | lr={controller.eta:.2e}")
 
     train_time = time.time() - t_start
     print(f"\nTraining complete: {train_time:.1f}s total, {train_time/args.total_steps:.1f}s/step")
@@ -175,27 +143,20 @@ def main() -> None:
 
     post_ppl = eval_perplexity(llm, held_out_ids, held_out_plens,
                                lora_request=backend.lora_pos)
+    ppl_ci = post_ppl['perplexity_ci95']
     print(f"  Held-out perplexity: {post_ppl['perplexity']:.2f} "
-          f"(NLL: {post_ppl['avg_nll']:.4f})")
+          f"(95% CI: {ppl_ci[0]:.2f}–{ppl_ci[1]:.2f})")
 
     post_gsm8k = eval_gsm8k(llm, lora_request=backend.lora_pos)
+    em_ci = post_gsm8k['exact_match_ci95']
     print(f"  GSM8K exact_match:   {post_gsm8k['exact_match']:.1%} "
-          f"({post_gsm8k['num_parsed']}/{post_gsm8k['num_samples']} parsed)")
+          f"(95% CI: {em_ci[0]:.1%}–{em_ci[1]:.1%})")
 
     # Summary
-    print("\n" + "=" * 70)
-    print("SFT EVALUATION SUMMARY")
-    print("=" * 70)
     ppl_delta = post_ppl['perplexity'] - baseline_ppl['perplexity']
-    ppl_pct = (ppl_delta / baseline_ppl['perplexity']) * 100
-    print(f"  Perplexity baseline:  {baseline_ppl['perplexity']:.2f}")
-    print(f"  Perplexity post-SFT:  {post_ppl['perplexity']:.2f}")
-    print(f"  Perplexity delta:     {ppl_delta:+.2f} ({ppl_pct:+.1f}%)")
-    print(f"  GSM8K baseline:       {baseline_gsm8k['exact_match']:.1%}")
-    print(f"  GSM8K post-training:  {post_gsm8k['exact_match']:.1%}")
-    print(f"  Final DD EMA:         {controller.dd_ema:.4f}")
-    print(f"  Training time:        {train_time:.1f}s ({train_time/args.total_steps:.1f}s/step)")
-    print(f"  Steps completed:      {args.total_steps}")
+    print(f"\n  Perplexity: {baseline_ppl['perplexity']:.2f} → {post_ppl['perplexity']:.2f} ({ppl_delta:+.2f})")
+    print(f"  GSM8K EM:   {baseline_gsm8k['exact_match']:.1%} → {post_gsm8k['exact_match']:.1%}")
+    print(f"  Time: {train_time:.1f}s ({train_time/args.total_steps:.1f}s/step)")
 
     # Save results
     results = {

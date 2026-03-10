@@ -1,19 +1,4 @@
-"""DS-MeZO Controller: zeroth-order optimization for LLM fine-tuning.
-
-Algorithm-only implementation — no vLLM imports. All inference calls go
-through the backend object passed at init.
-
-Self-adaptive, parameter-free optimizer:
-- LR: self-calibrating eps/dd_ema * cosine (Spall 1998 §7: a ~ c²)
-- Momentum: self-adaptive 1 - _ema_alpha() (VA-Muon complement)
-- AGZO activation-guided subspace perturbation
-- SPSA gradient estimation with ZClip reciprocal clipping (2504.02507)
-- ZO-Muon spectral optimizer (Newton-Schulz orthogonalization)
-- RLOO contrastive selection with REINFORCE++ normalization
-- Hybrid SFT→RL training pipeline
-
-Reference: DS_MeZO_Combined.md §8
-"""
+"""DS-MeZO Controller: AGZO + SPSA + ZO-Muon zeroth-order optimizer."""
 
 from __future__ import annotations
 
@@ -23,30 +8,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
+from optht import optht
 from safetensors.torch import load_file, save_file
+from torch.optim._muon import DEFAULT_A, DEFAULT_B, DEFAULT_C
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from ds_mezo.backend import _save_peft_adapter, _write_adapter_config
 from ds_mezo.kernels import zo_muon_update, fused_power_iter, fused_agzo_perturbation, fused_perturb_dual
 from ds_mezo.model_config import LayerSpec
 
-# Config defaults — matches YAML config surface.
-# Self-adaptive parameters (no manual tuning):
-#   eta: self-calibrating eps/dd_ema * cosine (Spall 1998 §7: a ~ c²)
-#   momentum: self-adaptive 1 - _ema_alpha() (VA-Muon complement)
-#   eps: 1e-3 / sqrt(rank) (SPSA theory — Spall 1998)
-#   DD clipping: z_thres=2.5 reciprocal clipping (ZClip — 2504.02507, Algorithm 1)
-# Protocol constants (not configurable):
-#   num_candidates=4 (RLOO canonical — Ahmadian et al. 2024)
-#   temperature: cosine decay from 1.0 (softmax identity) to 0.0
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "output_dir": "output",
     "staging_dir": "/dev/shm/ds_mezo",
     "adapter_path": "",
-    "model_path": "",
     "total_steps": 1000,
     "hybrid_switch_step": 0,
     "seed": 42,
-    "score_fn": None,
+    "score_fn": lambda text: 0.0,
 }
 
 
@@ -78,24 +58,20 @@ class DSMeZO_Controller:
     ) -> None:
         self.backend = backend
 
-        # Merge caller config over defaults (unknown keys silently ignored)
-        cfg = {k: config.get(k, v) for k, v in _CONFIG_DEFAULTS.items()}
+        cfg = {**_CONFIG_DEFAULTS, **config}
 
-        self.score_fn: Callable[[str], float] | None = cfg["score_fn"]
+        self.score_fn: Callable[[str], float] = cfg["score_fn"]
         self.step_count = 0
         self.total_steps: int = cfg["total_steps"]
         self.hybrid_switch_step: int = cfg["hybrid_switch_step"]
 
-        # Output directory — single root for all persistent artifacts
         self.output_dir = Path(cfg["output_dir"])
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Deterministic RNG for reproducible perturbations
         self.rng = torch.Generator(device="cuda")
         self.rng.manual_seed(cfg["seed"])
 
-        # Load pre-computed PiSSA adapter into FP32 master weights on GPU
         adapter_tensors = load_file(
             str(Path(cfg["adapter_path"]) / "adapter_model.safetensors"),
             device="cuda",
@@ -112,27 +88,28 @@ class DSMeZO_Controller:
                 module_name=ls.module_name,
                 peft_prefix=ls.peft_prefix,
             ))
-        del adapter_tensors
 
-        # Infer rank from adapter tensor shapes (B is r×d_in)
         rank = self.layers[0].B.shape[0]
-
-        # Initial adapter sync
         self.backend.sync_adapters({}, {}, self.layers)
 
-        # Exploration — RLOO canonical sample count (Ahmadian et al. 2024)
-        # Cosine temperature from 1.0 (softmax identity) to 0.0 (greedy)
         self.num_candidates = 4
         self.explore_temperature = 1.0
 
-        # Fixed epsilon (FlatZero — 2506.05454: fixed ε preserves flat-minima regularization)
-        # SPSA theory (Spall 1998): optimal perturbation scale c₀ ≈ 1e-3 / sqrt(rank)
-        self.eps = 1e-3 / math.sqrt(rank)
+        # eps = median(‖W‖_F) * eps_machine^(1/3) (Numerical Recipes §5.7)
+        eps_machine = torch.finfo(torch.float32).eps
+        norms = torch.stack([torch.linalg.norm(l.A) for l in self.layers] +
+                             [torch.linalg.norm(l.B) for l in self.layers])
+        self.eps = float(torch.median(norms)) * float(eps_machine) ** (1.0 / 3.0)
 
-        # Optimizer: ZO-Muon (§5) — LR self-calibrates from eps/dd_ema after step 1
-        self.eta = self.eps
+        # eta_max = eps (trust-region: step ≤ perturbation radius)
+        self.eta_max = self.eps
+        self.eta = self.eta_max
+        self._lr_param = torch.nn.Parameter(torch.empty(0, device="cuda"))
+        self._lr_opt = torch.optim.SGD([self._lr_param], lr=self.eta_max)
+        self.lr_scheduler = CosineAnnealingLR(
+            self._lr_opt, T_max=self.total_steps, eta_min=0.0,
+        )
 
-        # Pre-allocate momentum, scratch, and perturbation output buffers
         self.momentum_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.scratch_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.pos_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
@@ -149,67 +126,92 @@ class DSMeZO_Controller:
             self.neg_buffers[key_A] = torch.empty_like(layer.A)
             self.neg_buffers[key_B] = torch.empty_like(layer.B)
 
-        # Activation subspace tracking — per-step power iteration (§3.5)
-        # r_calib = rank/2: for LoRA-rank adapters, the subspace dimension should be
-        # proportional to adapter rank. AGZO (2601.17261) uses r=1 for full-weight
-        # perturbations; for rank-r LoRA, rank//2 spans the dominant subspace while
-        # keeping memory proportional to adapter size.
-        self.r_calib = rank // 2
-        # Warm-started power iteration converges cubically (Halko et al. 2011, §4.4).
-        # 3 iterations: error ∝ ε₀^27 ≈ 0 for any reasonable ε₀ < 0.5.
-        self.power_iter_steps = 3
+        self._bf16_ckpt: dict[str, torch.Tensor] = {}
+
+        self.r_calib = 0
         self.activation_bases: dict[tuple[int, str], torch.Tensor] = {}
 
-        # ZClip on directional derivative (2504.02507)
-        self.dd_ema: float = 0.0
-        self.dd_var_ema: float = 0.0
+        eps_dtype = torch.finfo(torch.float32).eps
 
-    # -- Adaptive EMA (VA-Muon — 2601.14603) --------------------------------
+        # N-S iterations: 3-term scalar simulation for s_min = 1/sqrt(rank)
+        self.ns_iterations = self._ns_iters_for_smin(
+            1.0 / math.sqrt(rank), float(eps_dtype),
+        )
 
-    def _ema_alpha(self) -> float:
-        """Adaptive EMA smoothing factor: responsive early, stable late.
+        # Power iteration steps: ceil(log(log(1/eps)/log(2))/log(3))
+        self.power_iter_steps = math.ceil(
+            math.log(math.log(1.0 / eps_dtype) / math.log(2.0)) / math.log(3.0)
+        )
+        self.norm_floor = torch.finfo(torch.float32).tiny
 
-        Window ramps from 1 (fully responsive at step 1) to sqrt(total_steps),
-        giving alpha = 1/window. The sqrt follows from the bias-variance tradeoff
-        for estimating a slowly-varying mean.
-        """
-        max_window = int(math.sqrt(self.total_steps))
-        return 1.0 / min(self.step_count, max_window)
+    @staticmethod
+    def _ns_iters_for_smin(s_min: float, eps_dtype: float) -> int:
+        """Simulate scalar N-S map from s_min until convergence."""
+        a, b, c = DEFAULT_A, DEFAULT_B, DEFAULT_C
+        s = s_min
+        for k in range(20):
+            s2 = s * s
+            s = s * (a + b * s2 + c * s2 * s2)
+            if abs(s - 1.0) < eps_dtype:
+                return k + 1
+        return 20
 
     # -- Activation Subspace Tracking (§3.5) --------------------------------
 
     def _calibrate_activation_bases_full(self, input_data: list[str]) -> None:
-        """Full SVD calibration — used once at init."""
+        """Full SVD calibration — determines r_calib via Gavish-Donoho threshold."""
         activations = self.backend.extract_activations(input_data)
+        rank = self.layers[0].B.shape[0]
+
+        gpu_acts: dict[int, torch.Tensor] = {}
         for layer in self.layers:
-            H = activations[layer.key].cuda()
-            _, _, V = torch.svd_lowrank(H, q=self.r_calib, niter=2)
-            self.activation_bases[layer.key] = V
+            act = activations[layer.key]
+            if id(act) not in gpu_acts:
+                gpu_acts[id(act)] = act.cuda(non_blocking=True)
+
+        ranks_per_activation: list[int] = []
+        seen: set[int] = set()
+        for layer in self.layers:
+            act_id = id(activations[layer.key])
+            if act_id in seen:
+                continue
+            seen.add(act_id)
+            H = gpu_acts[act_id]
+            sv = torch.linalg.svdvals(H).cpu().numpy()
+            m, n = H.shape
+            beta = max(m, n) / min(m, n)
+            ranks_per_activation.append(optht(beta, sv=sv, sigma=None))
+        self.r_calib = int(np.median(ranks_per_activation))
+
+        svd_cache: dict[int, torch.Tensor] = {}
+        for layer in self.layers:
+            act_id = id(activations[layer.key])
+            if act_id not in svd_cache:
+                H = gpu_acts[act_id]
+                _, _, V = torch.svd_lowrank(H, q=self.r_calib, niter=self.power_iter_steps)
+                svd_cache[act_id] = V
+            self.activation_bases[layer.key] = svd_cache[act_id]
 
     def _update_activation_bases(
         self, activations: dict[tuple[int, str], torch.Tensor],
     ) -> None:
-        """Warm-started power iteration via fused Triton kernel.
-
-        Replaces 3× (matmul + matmul + QR) = 9 kernel launches per layer
-        with a single fused kernel launch per layer.
-        """
+        """Warm-started power iteration via fused Triton kernel."""
+        processed: dict[int, torch.Tensor] = {}
         for layer in self.layers:
-            H = activations[layer.key].cuda()
-            V = self.activation_bases[layer.key]
-            self.activation_bases[layer.key] = fused_power_iter(
-                H, V, num_iters=self.power_iter_steps,
-            )
+            act = activations[layer.key]
+            act_id = id(act)
+            if act_id not in processed:
+                H = act.cuda(non_blocking=True)
+                V = self.activation_bases[layer.key]
+                processed[act_id] = fused_power_iter(
+                    H, V, num_iters=self.power_iter_steps, norm_floor=self.norm_floor,
+                )
+            self.activation_bases[layer.key] = processed[act_id]
 
     # -- Perturbation (§3.2) ------------------------------------------------
 
     def _get_perturbation(self, layer: LayerState) -> tuple[torch.Tensor, torch.Tensor]:
-        """AGZO subspace perturbation for A and B via fused Triton kernel.
-
-        B perturbation: project random coefficients into activation subspace V.
-        A perturbation: project into B's column space via QR(B @ V).
-        Single kernel: matmuls + MGS QR + scaling fused, eliminates cuSOLVER overhead.
-        """
+        """AGZO subspace perturbation via fused Triton kernel."""
         A, B = layer.A, layer.B
         V_l = self.activation_bases[layer.key]
 
@@ -220,9 +222,7 @@ class DSMeZO_Controller:
             A.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         )
 
-        return fused_agzo_perturbation(B, V_l, z_coeff_B, z_coeff_A, self.eps)
-
-    # -- Scoring (§4.3) -----------------------------------------------------
+        return fused_agzo_perturbation(B, V_l, z_coeff_B, z_coeff_A, self.eps, self.norm_floor)
 
     def _score_contrastive(
         self,
@@ -230,12 +230,7 @@ class DSMeZO_Controller:
         advantages: tuple[float, float],
         prompt_len: int,
     ) -> tuple[float, float]:
-        """Advantage-weighted NLL scoring.
-
-        When RLOO advantages are both zero (all candidates scored equally),
-        the weighted sum produces zero loss for both perturbations, giving
-        dd = 0 and no parameter update — the correct behavior.
-        """
+        """Advantage-weighted NLL under θ+ and θ-."""
         winner_tokens, loser_tokens = trajectories
         adv_w, adv_l = advantages
 
@@ -248,8 +243,6 @@ class DSMeZO_Controller:
 
         return loss_pos, loss_neg
 
-    # -- SFT Loss -----------------------------------------------------------
-
     def _compute_loss_sft(
         self, token_ids: list[int], prompt_len: int,
     ) -> tuple[float, float]:
@@ -259,20 +252,10 @@ class DSMeZO_Controller:
 
         return _mean_nll(lp_pos), _mean_nll(lp_neg)
 
-    # -- Exploration (§4.1, §4.2) -------------------------------------------
-
-    def _update_temperature(self) -> None:
-        """Cosine temperature decay: 1.0 (softmax identity) → 0.0 (greedy)."""
-        progress = self.step_count / self.total_steps
-        self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
-
     def _explore(
         self, batch: list[str],
     ) -> tuple[tuple[list[int], list[int]], tuple[float, float], int]:
-        """Generate candidates, compute RLOO advantages with normalization.
-
-        Returns (trajectories, advantages, prompt_len).
-        """
+        """Generate candidates, compute RLOO advantages, return (trajectories, advantages, prompt_len)."""
         self.backend.sync_adapters({}, {}, self.layers)
         request_outputs = self.backend.generate(
             batch, self.explore_temperature, self.num_candidates
@@ -288,21 +271,13 @@ class DSMeZO_Controller:
         best_output, best_reward = scored[0]
         worst_output, worst_reward = scored[-1]
 
-        # RLOO advantages (§4.2) with REINFORCE++ normalization
-        all_rewards = [r for _, r in scored]
-        total_reward = sum(all_rewards)
+        # RLOO advantages with REINFORCE++ normalization
+        rewards = torch.tensor([r for _, r in scored])
         N = len(scored)
-        adv_w = best_reward - (total_reward - best_reward) / (N - 1)
-        adv_l = worst_reward - (total_reward - worst_reward) / (N - 1)
-
-        # Normalize by reward standard deviation (REINFORCE++)
-        # Epsilon-stabilized: when all rewards are equal, advantages are already
-        # zero, so dividing by ~0 still gives ~0 without NaN.
-        mean_r = total_reward / N
-        reward_var = sum((r - mean_r) ** 2 for r in all_rewards) / N
-        reward_std = reward_var ** 0.5 + 1e-8
-        adv_w /= reward_std
-        adv_l /= reward_std
+        baselines = (rewards.sum() - rewards) / (N - 1)
+        advantages = (rewards - baselines) / rewards.std()
+        adv_w = float(advantages[0])   # best (sorted descending)
+        adv_l = float(advantages[-1])  # worst
 
         winner_full = list(prompt_token_ids) + list(best_output.token_ids)
         loser_full = list(prompt_token_ids) + list(worst_output.token_ids)
@@ -310,77 +285,21 @@ class DSMeZO_Controller:
 
         return (winner_full, loser_full), (adv_w, adv_l), prompt_len
 
-    # -- ZClip (2504.02507) -------------------------------------------------
-
-    def _zclip(self, dd: float) -> float:
-        """ZClip: reciprocal clipping on directional derivative (2504.02507, Algorithm 1).
-
-        Reciprocal clipping: z* = z_thres² / z for z > z_thres.
-        Clips more aggressively for larger outliers while remaining continuous
-        at the threshold (ZClip paper §2.3.2, recommended over hard clipping).
-        z_thres=2.5 per paper's empirical recommendation.
-        """
-        alpha = self._ema_alpha()
-        abs_dd = abs(dd)
-
-        if self.step_count == 1:
-            self.dd_ema = abs_dd
-            return dd
-
-        dd_std = math.sqrt(self.dd_var_ema)
-        z_thres = 2.5
-        z_score = (abs_dd - self.dd_ema) / (dd_std + 1e-8)
-
-        if z_score > z_thres:
-            # Reciprocal clipping: map z → z_thres² / z (continuous at z=z_thres)
-            clipped_z = z_thres ** 2 / z_score
-            clipped_abs = self.dd_ema + clipped_z * dd_std
-            clipped = math.copysign(clipped_abs, dd)
-        else:
-            clipped = dd
-
-        diff = abs_dd - self.dd_ema
-        self.dd_ema += alpha * diff
-        self.dd_var_ema = (1.0 - alpha) * (self.dd_var_ema + alpha * diff ** 2)
-
-        return clipped
-
-    # -- Self-calibrating LR (§5.3) ----------------------------------------
-
-    def _update_lr(self) -> None:
-        """Self-calibrating LR: eps/dd_ema * cosine (Spall 1998 §7: a ~ c²).
-
-        eps/dd_ema ≈ eps²/loss_scale — gives the theoretically optimal
-        step-to-perturbation ratio while being scale-invariant.
-        """
-        progress = self.step_count / self.total_steps
-        cosine = 0.5 * (1 + math.cos(math.pi * progress))
-        self.eta = self.eps / self.dd_ema * cosine
-
-    # -- Unified Training Step ----------------------------------------------
-
     def step(self, batch: list[str] | dict[str, Any]) -> None:
         self.step_count += 1
+        use_rl_loss = self.step_count > self.hybrid_switch_step
 
-        # Determine loss mode for this step
-        use_rl_loss = (self.step_count > self.hybrid_switch_step)
-
-        # RL exploration (only when computing RL loss)
-        trajectories, advantages, prompt_len = None, None, None
         if use_rl_loss:
             trajectories, advantages, prompt_len = self._explore(batch)
 
-        # Activation tracking (bases must be calibrated before first step)
         input_for_activations = batch if isinstance(batch, list) else [batch["prompt_text"]]
         batch_activations = self.backend.extract_activations(input_for_activations)
         self._update_activation_bases(batch_activations)
 
-        # AGZO perturbation
         perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
             perturbations[layer.key] = self._get_perturbation(layer)
 
-        # Dual perturbation: θ+ = base + z, θ- = base - z (fused kernel)
         pos_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
@@ -394,19 +313,15 @@ class DSMeZO_Controller:
 
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
 
-        # Loss computation
         if use_rl_loss:
             loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
         else:
             loss_pos, loss_neg = self._compute_loss_sft(batch["token_ids"], batch["prompt_len"])
 
-        # ZO-Muon update with ZClip
-        raw_dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
-        dd = self._zclip(raw_dd)
+        dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
 
-        # Self-adaptive momentum: 1 - _ema_alpha() (VA-Muon complement)
-        # Starts at 0 (step 1: fully responsive), ramps to 1 - 1/sqrt(total_steps)
-        momentum = 1.0 - self._ema_alpha()
+        max_window = int(math.sqrt(self.total_steps))
+        momentum = 1.0 - 1.0 / min(self.step_count, max_window)
 
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
@@ -414,38 +329,26 @@ class DSMeZO_Controller:
             key_B = (layer.key, "B")
             zo_muon_update(layer.A, self.momentum_buffers[key_A],
                            z_A, self.scratch_buffers[key_A],
-                           dd, momentum, self.eta)
+                           dd, momentum, self.eta,
+                           self.ns_iterations, self.norm_floor)
             zo_muon_update(layer.B, self.momentum_buffers[key_B],
                            z_B, self.scratch_buffers[key_B],
-                           dd, momentum, self.eta)
+                           dd, momentum, self.eta,
+                           self.ns_iterations, self.norm_floor)
 
-        # Schedule updates
-        self._update_lr()
+        self.lr_scheduler.step()
+        self.eta = self._lr_opt.param_groups[0]["lr"]
         if use_rl_loss:
-            self._update_temperature()
-
-    # -- Main Training Loop -------------------------------------------------
+            progress = self.step_count / self.total_steps
+            self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
 
     def train(
         self,
         rl_data: list[str],
         sft_data: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Train for total_steps.
-
-        rl_data: list of prompt strings for RL steps (required).
-        sft_data: list of dicts with {token_ids, prompt_len, prompt_text} for SFT steps.
-            Required when hybrid_switch_step > 0.
-
-        Steps 1..hybrid_switch_step use SFT loss on sft_data.
-        Steps hybrid_switch_step+1..total_steps use RL loss on rl_data.
-
-        Activation bases must be calibrated via _calibrate_activation_bases_full()
-        before calling train().
-        """
-        # Log every ~1% of training, checkpoint every ~10%
-        log_interval = max(1, self.total_steps // 100)
-        ckpt_interval = max(1, self.total_steps // 10)
+        log_interval = self.total_steps // 100
+        ckpt_interval = self.total_steps // 10
 
         for step_idx in range(self.step_count, self.total_steps):
             if step_idx < self.hybrid_switch_step:
@@ -458,8 +361,7 @@ class DSMeZO_Controller:
                 print(
                     f"step={step_idx + 1}/{self.total_steps} "
                     f"lr={self.eta:.2e} "
-                    f"temp={self.explore_temperature:.3f} "
-                    f"dd_ema={self.dd_ema:.4f}"
+                    f"temp={self.explore_temperature:.3f}"
                 )
 
             if (step_idx + 1) % ckpt_interval == 0:
@@ -468,21 +370,17 @@ class DSMeZO_Controller:
         self._save_checkpoint(self.total_steps)
 
     def _save_checkpoint(self, step: int) -> None:
-        """Save checkpoint as safetensors + JSON (no pickle)."""
         step_dir = self.checkpoint_dir / f"step_{step}"
         step_dir.mkdir(parents=True, exist_ok=True)
 
         rank = self.layers[0].B.shape[0]
         target_modules = sorted({l.module_name for l in self.layers})
 
-        # PEFT-compatible adapter (BF16)
         A_list = [l.A for l in self.layers]
         B_list = [l.B for l in self.layers]
-        _save_peft_adapter(A_list, B_list, step_dir, self.layers)
+        _save_peft_adapter(A_list, B_list, step_dir, self.layers, self._bf16_ckpt)
         _write_adapter_config(step_dir, rank, target_modules)
 
-        # Optimizer tensors (FP32) — flatten tuple keys to dot-separated strings
-        # safetensors handles GPU→disk transfer internally via Rust backend
         tensors: dict[str, torch.Tensor] = {}
         for layer in self.layers:
             idx, mod = layer.layer_idx, layer.module_name
@@ -494,51 +392,18 @@ class DSMeZO_Controller:
         tensors["rng_state"] = self.rng.get_state()
         save_file(tensors, str(step_dir / "optimizer_state.safetensors"))
 
-        # Scalar state as JSON
         training_state = {
             "step": step,
-            "dd_ema": self.dd_ema,
-            "dd_var_ema": self.dd_var_ema,
             "eta": self.eta,
             "explore_temperature": self.explore_temperature,
         }
         with open(step_dir / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2)
 
-        # Overwrite latest adapter at output_dir/adapter
         adapter_dir = self.output_dir / "adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        _save_peft_adapter(A_list, B_list, adapter_dir, self.layers)
+        _save_peft_adapter(A_list, B_list, adapter_dir, self.layers, self._bf16_ckpt)
         _write_adapter_config(adapter_dir, rank, target_modules)
 
         print(f"Checkpoint saved: {step_dir}")
 
-    def _load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Restore state from a safetensors + JSON checkpoint."""
-        with open(checkpoint_path / "training_state.json") as f:
-            ts = json.load(f)
-
-        self.step_count = ts["step"]
-        self.dd_ema = ts["dd_ema"]
-        self.dd_var_ema = ts["dd_var_ema"]
-        self.eta = ts["eta"]
-        self.explore_temperature = ts["explore_temperature"]
-
-        # Load optimizer tensors
-        opt = load_file(
-            str(checkpoint_path / "optimizer_state.safetensors"), device="cuda",
-        )
-
-        for layer in self.layers:
-            idx, mod = layer.layer_idx, layer.module_name
-            layer.A.copy_(opt[f"master.layer{idx}.{mod}.A"])
-            layer.B.copy_(opt[f"master.layer{idx}.{mod}.B"])
-            self.momentum_buffers[(layer.key, "A")].copy_(opt[f"momentum.layer{idx}.{mod}.A"])
-            self.momentum_buffers[(layer.key, "B")].copy_(opt[f"momentum.layer{idx}.{mod}.B"])
-            self.activation_bases[layer.key] = opt[f"act_basis.layer{idx}.{mod}"]
-
-        # Generator.set_state() requires CPU ByteTensor (PyTorch API constraint)
-        self.rng.set_state(opt["rng_state"].cpu())
-
-        self.backend.sync_adapters({}, {}, self.layers)
-        print(f"Checkpoint loaded: {checkpoint_path}")
