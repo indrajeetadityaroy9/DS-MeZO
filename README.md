@@ -22,19 +22,18 @@ DS-MeZO removes all three constraints. The optimizer estimates gradients via for
 
 **PiSSA Subspace Initialization** (`scripts/prepare_pissa.py`) — Decompose pretrained weight matrices via truncated SVD into a low-rank adapter (A, B) and residual: W = A@B + W_res. The adapter captures the top singular components, providing an information-dense starting point. PiSSA adapters are natively LoRA-compatible — no custom inference code required.
 
-**AGZO (Activation-Guided Zeroth-Order)** (`controller.py:_get_perturbation()` → `kernels.py:fused_agzo_perturbation()`) — Perturbations are projected into the activation subspace of the current batch rather than applied in the full parameter space. For B matrices (r × d_in), perturbations are projected into the top-r_calib right singular vectors of the activation matrix; for A matrices (d_out × r), perturbations are projected into B's column space. This reduces effective ZO dimensionality by ~8x, concentrating gradient signal where the model actually operates. Activation bases are tracked online via warm-started subspace iteration (`kernels.py:fused_power_iter()`), initialized by full SVD calibration with Gavish-Donoho optimal rank threshold (Marchenko-Pastur, IEEE Trans. Info. Theory 2014).
+**AGZO (Activation-Guided Zeroth-Order)** (`controller.py:_get_perturbation()` → `kernels.py:fused_agzo_perturbation()`) — Perturbations are projected into the activation subspace of the current batch rather than applied in the full parameter space. For B matrices (r × d_in), perturbations are projected into the top-r_calib right singular vectors of the activation matrix, weighted by per-dimension momentum energy for variance reduction (P-GAP-inspired, arXiv:2510.18228); for A matrices (d_out × r), perturbations are projected into B's column space. This reduces effective ZO dimensionality by ~8x, concentrating gradient signal where the model actually operates. Activation bases are tracked online via warm-started subspace iteration (`kernels.py:fused_power_iter()`), initialized by full SVD calibration with Gavish-Donoho optimal rank threshold (Marchenko-Pastur, IEEE Trans. Info. Theory 2014).
 
 **RLOO (REINFORCE Leave-One-Out)** (`controller.py:_explore()`) — Generate N=4 candidates under unperturbed weights, score with the task reward function, compute leave-one-out advantages: adv_i = r_i - mean(r_j, j != i). Unbiased, minimum-variance, no tunable baseline. Combined with trajectory locking: candidates are generated once, then scored under both perturbed weight configurations for SPSA.
 
 **Contrastive Scoring** (`controller.py:_score_contrastive()`) — Advantage-weighted NLL under θ+ (base + εz) and θ- (base - εz). The directional derivative dd = (loss+ - loss-) / 2ε is a scalar shared across all layers — the SPSA key insight that makes ZO tractable for millions of parameters.
 
-**ZO-Muon Spectral Update** (`kernels.py:zo_muon_update()`) — Fused Triton kernel: SPSA gradient → adaptive momentum → Frobenius normalization → 3-term Newton-Schulz orthogonalization (canonical Muon coefficients) → parameter update. Newton-Schulz extracts dominant spectral directions from momentum-accumulated ZO gradients, denoising correlated estimates from the fixed AGZO subspace. Dispatches tall (d_out > r) vs wide (d_out ≤ r) kernel variants. N-S iteration count derived via scalar simulation for `s_min = 1/√rank`.
+**ZO-Muon Spectral Update** (`kernels.py:zo_muon_update()`) — Fused Triton kernel: SPSA gradient → adaptive momentum → Frobenius normalization → 12-iteration minimax-optimal degree-3 Newton-Schulz orthogonalization (Equioscillation Theorem, Amsel et al. 2025) → parameter update. Newton-Schulz extracts dominant spectral directions from momentum-accumulated ZO gradients, denoising correlated estimates from the fixed AGZO subspace. Dispatches tall (d_out > r) vs wide (d_out ≤ r) kernel variants. All FP32 + allow_tf32=False (R=16 Gram products below Hopper HMMA efficiency threshold). Convergence basin ℓ=√ε_f32 and 12-iteration count derived from FP32 dtype; greedy composition is globally optimal (Theorem 4.1). Closed-form coefficients per iteration — no manual constants. Total kernel overhead: ~620μs/step across 161 launches (<1% of vLLM-dominated step time).
 
 **Derived Schedules** — All optimizer hyperparameters are derived from model weights and dtype at init, eliminating manual tuning:
 - **Epsilon**: `median(‖W‖_F) * eps_machine^(1/3)` (Numerical Recipes §5.7 optimal centered-difference step). Scale-invariant, derived from weight norms.
 - **Learning rate**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes the update unit-spectral-norm; trust-region argument: step no further than the perturbation radius where the gradient estimate is valid.
 - **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
-- **Temperature**: Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
 
 ### Architecture
 
@@ -134,8 +133,7 @@ eval/
 
 scripts/
   prepare_pissa.py — Offline PiSSA decomposition
-  train.py         — Training entry point (YAML config + JSONL prompts)
-  launch.sh        — GPU clock lock + environment setup
+  train.py         — Training entry point (environment setup, GPU clocks, YAML config + JSONL prompts)
 ```
 
 ## Evaluation
@@ -181,6 +179,8 @@ Comparison axes: pass@1 improvement, peak VRAM, training throughput. If DS-MeZO 
 - **PiSSA** (Meng et al., 2024) — Principal Singular Values and Vectors Adaptation
 - **AGZO** (arXiv:2601.17261) — Activation-guided zeroth-order optimization
 - **ZO-Muon** (arXiv:2602.17155) — Zeroth-order Muon optimizer
+- **Polar Express** (Amsel et al., 2025; arXiv:2505.16932) — Minimax-optimal polynomial composition for matrix sign/polar decomposition
+- **P-GAP** (arXiv:2510.18228) — Gradient-aligned perturbations for ZO variance reduction
 - **RLOO** (Ahmadian et al., 2024) — REINFORCE Leave-One-Out baseline
 - **Muon** (Keller Jordan, 2024; `torch.optim.Muon` in PyTorch 2.10) — Newton-Schulz orthogonalization for optimizer updates
 

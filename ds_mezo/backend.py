@@ -8,8 +8,19 @@ from typing import Any
 import torch
 from peft import LoraConfig
 from safetensors.torch import save_file
-from vllm import SamplingParams
+from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
+
+def create_engine(model_path: str | Path, rank: int) -> LLM:
+    return LLM(
+        model=str(model_path),
+        dtype="bfloat16",
+        gpu_memory_utilization=0.95,
+        enable_lora=True,
+        max_lora_rank=max(64, rank),
+        enforce_eager=True,
+    )
+
 
 _VLLM_MERGES: dict[str, str] = {
     "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
@@ -148,6 +159,7 @@ class VLLMBackend:
 
         self._bf16_pos: dict[str, torch.Tensor] = {}
         self._bf16_neg: dict[str, torch.Tensor] = {}
+        self.query_count = 0
 
     def sync_adapters(
         self,
@@ -181,6 +193,7 @@ class VLLMBackend:
     def generate(
         self, batch: list[str], temperature: float, n: int,
     ) -> list[Any]:
+        self.query_count += len(batch) * n
         gen_params = SamplingParams(n=n, temperature=temperature)
         return self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
@@ -189,6 +202,7 @@ class VLLMBackend:
     def score(
         self, token_sequences: list[list[int]], lora_request: LoRARequest,
     ) -> list[list[float]]:
+        self.query_count += len(token_sequences)
         prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
         outputs = self.engine.generate(
             prompts, sampling_params=self.score_params, lora_request=lora_request,
@@ -201,6 +215,7 @@ class VLLMBackend:
     def extract_activations(
         self, input_data: list[str],
     ) -> dict[tuple[int, str], torch.Tensor]:
+        self.query_count += len(input_data)
         self.engine.collective_rpc(
             _register_activation_hooks, args=(self.hook_map,)
         )

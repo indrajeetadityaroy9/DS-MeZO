@@ -12,7 +12,6 @@ import numpy as np
 import torch
 from optht import optht
 from safetensors.torch import load_file, save_file
-from torch.optim._muon import DEFAULT_NS_STEPS
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ds_mezo.backend import _save_peft_adapter, _write_adapter_config
@@ -25,7 +24,6 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "adapter_path": "",
     "total_steps": 1000,
     "seed": 42,
-    "temperature": 1.0,
     "score_fn": lambda text: 0.0,
     "resume_from": None,
 }
@@ -93,7 +91,7 @@ class DSMeZO_Controller:
         self.backend.sync_adapters({}, {}, self.layers)
 
         self.num_candidates = 4
-        self.temperature: float = cfg["temperature"]
+        self.temperature = 1.0
 
         # eps = median(‖W‖_F) * eps_machine^(1/3) (Numerical Recipes §5.7)
         eps_machine = torch.finfo(torch.float32).eps
@@ -133,8 +131,6 @@ class DSMeZO_Controller:
 
         eps_dtype = torch.finfo(torch.float32).eps
 
-        self.ns_iterations = DEFAULT_NS_STEPS
-
         # Power iteration steps: ceil(log(log(1/eps)/log(2))/log(3))
         self.power_iter_steps = math.ceil(
             math.log(math.log(1.0 / eps_dtype) / math.log(2.0)) / math.log(3.0)
@@ -164,7 +160,6 @@ class DSMeZO_Controller:
             state = json.load(f)
         self.step_count = state["step"]
         self.eta = state["eta"]
-        self.temperature = state["temperature"]
         self.lr_scheduler.load_state_dict(state["lr_scheduler"])
         self.r_calib = self.activation_bases[self.layers[0].key].shape[1]
 
@@ -223,13 +218,19 @@ class DSMeZO_Controller:
     # -- Perturbation (§3.2) ------------------------------------------------
 
     def _get_perturbation(self, layer: LayerState) -> tuple[torch.Tensor, torch.Tensor]:
-        """AGZO subspace perturbation via fused Triton kernel."""
+        """AGZO subspace perturbation with momentum-informed weighting."""
         A, B = layer.A, layer.B
         V_l = self.activation_bases[layer.key]
 
         z_coeff_B = torch.randn(
             B.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         )
+        M_B = self.momentum_buffers[(layer.key, "B")]
+        M_proj = M_B @ V_l  # (r, r_calib) — momentum in activation coords
+        col_energies = torch.linalg.norm(M_proj, dim=0)  # (r_calib,)
+        scale = col_energies / (col_energies.mean() + self.norm_floor)
+        z_coeff_B = z_coeff_B * (1 + scale[None, :])
+
         z_coeff_A = torch.randn(
             A.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         )
@@ -326,12 +327,10 @@ class DSMeZO_Controller:
             key_B = (layer.key, "B")
             zo_muon_update(layer.A, self.momentum_buffers[key_A],
                            z_A, self.scratch_buffers[key_A],
-                           dd, momentum, self.eta,
-                           self.ns_iterations, self.norm_floor)
+                           dd, momentum, self.eta, self.norm_floor)
             zo_muon_update(layer.B, self.momentum_buffers[key_B],
                            z_B, self.scratch_buffers[key_B],
-                           dd, momentum, self.eta,
-                           self.ns_iterations, self.norm_floor)
+                           dd, momentum, self.eta, self.norm_floor)
 
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
@@ -381,7 +380,6 @@ class DSMeZO_Controller:
         training_state = {
             "step": step,
             "eta": self.eta,
-            "temperature": self.temperature,
             "lr_scheduler": self.lr_scheduler.state_dict(),
         }
         with open(step_dir / "training_state.json", "w") as f:

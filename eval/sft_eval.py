@@ -12,10 +12,9 @@ import torch
 from datasets import load_dataset
 from peft import PeftConfig
 from transformers import AutoTokenizer
-from vllm import LLM
 
 from ds_mezo.model_config import discover_layers
-from ds_mezo.backend import VLLMBackend
+from ds_mezo.backend import VLLMBackend, create_engine
 from ds_mezo.controller import DSMeZO_Controller
 from ds_mezo.kernels import fused_perturb_dual, zo_muon_update
 from eval.benchmarks import eval_perplexity, eval_gsm8k
@@ -53,9 +52,9 @@ def sft_step(ctrl: DSMeZO_Controller, sample: dict) -> None:
         z_A, z_B = perturbations[layer.key]
         key_A, key_B = (layer.key, "A"), (layer.key, "B")
         zo_muon_update(layer.A, ctrl.momentum_buffers[key_A], z_A, ctrl.scratch_buffers[key_A],
-                       dd, momentum, ctrl.eta, ctrl.ns_iterations, ctrl.norm_floor)
+                       dd, momentum, ctrl.eta, ctrl.norm_floor)
         zo_muon_update(layer.B, ctrl.momentum_buffers[key_B], z_B, ctrl.scratch_buffers[key_B],
-                       dd, momentum, ctrl.eta, ctrl.ns_iterations, ctrl.norm_floor)
+                       dd, momentum, ctrl.eta, ctrl.norm_floor)
 
     ctrl.lr_scheduler.step()
     ctrl.eta = ctrl._lr_opt.param_groups[0]["lr"]
@@ -118,14 +117,7 @@ def main() -> None:
 
     print("\nLoading vLLM engine...")
     t0 = time.time()
-    llm = LLM(
-        model=str(args.model_path),
-        dtype="bfloat16",
-        gpu_memory_utilization=0.95,
-        enable_lora=True,
-        max_lora_rank=max(64, rank),
-        enforce_eager=True,
-    )
+    llm = create_engine(args.model_path, rank)
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
     layer_specs = discover_layers(args.model_path, target_modules)

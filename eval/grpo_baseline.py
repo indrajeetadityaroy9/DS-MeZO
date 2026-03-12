@@ -13,11 +13,11 @@ from datasets import Dataset
 from peft import PeftConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
-from vllm import LLM
 from vllm.lora.request import LoRARequest
 
 import evaluate
 
+from ds_mezo.backend import create_engine
 from eval.benchmarks import eval_mbpp, load_mbpp_train
 from eval.utils import extract_code
 
@@ -102,14 +102,7 @@ def main() -> None:
     print("\nLoading vLLM engine for pre-training eval...")
     t0 = time.time()
 
-    eval_engine = LLM(
-        model=str(args.model_path),
-        dtype="bfloat16",
-        gpu_memory_utilization=0.95,
-        enable_lora=True,
-        max_lora_rank=max(64, rank),
-        enforce_eager=True,
-    )
+    eval_engine = create_engine(args.model_path, rank)
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
     lora_req = LoRARequest("pissa_init", 1, str(args.adapter_path))
@@ -178,14 +171,7 @@ def main() -> None:
 
     print("\nLoading vLLM engine for post-training eval...")
 
-    eval_engine = LLM(
-        model=str(args.model_path),
-        dtype="bfloat16",
-        gpu_memory_utilization=0.95,
-        enable_lora=True,
-        max_lora_rank=max(64, rank),
-        enforce_eager=True,
-    )
+    eval_engine = create_engine(args.model_path, rank)
     lora_req = LoRARequest("grpo_trained", 1, str(adapter_save_path))
     post_mbpp = eval_mbpp(eval_engine, lora_request=lora_req,
                           n_samples=args.n_samples, temperature=args.temperature)

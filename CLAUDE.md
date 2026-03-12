@@ -17,9 +17,9 @@ pip install -e .
 # PiSSA decomposition (prerequisite — creates residual model + adapter)
 python -m scripts.prepare_pissa --model <model_path> --output <output_dir> [--targets q_proj v_proj]
 
-# Training (requires GPU, vLLM — launch.sh sets environment variables and locks GPU clocks)
-bash scripts/launch.sh <config.yaml> <prompts.jsonl>
-# Internally runs: python -m scripts.train --config <config.yaml> --prompts <prompts.jsonl>
+# Training (requires GPU, vLLM — train.py sets environment automatically)
+python -m scripts.train --config <config.yaml> --prompts <prompts.jsonl>
+# Optional: --lock-clocks to lock GPU to max clocks (requires sudo)
 
 # Evaluation scripts (each requires GPU + PiSSA-prepared model)
 python -m eval.rl_bench_eval --model-path <path> --adapter-path <path> --output-dir <path>
@@ -52,9 +52,9 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Core modules (`ds_mezo/`)
 
-- **`controller.py`** — RL training loop. Single `step()` executes the full AGZO+SPSA+ZO-Muon pipeline. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR`, `optht`, and `torch.optim.Muon` N-S coefficients.
+- **`controller.py`** — RL training loop. Single `step()` executes the full AGZO+SPSA+ZO-Muon pipeline. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR` and `optht`. Momentum-weighted AGZO perturbation (P-GAP-inspired variance reduction).
 - **`backend.py`** — vLLM isolation layer. Handles adapter serialization (PEFT format), generation, prefill-only logprob scoring, and activation extraction via forward hooks. All vLLM-specific code lives here.
-- **`kernels.py`** — Four Hopper-native Triton kernels: `zo_muon_update` (fused gradient + momentum + Newton-Schulz + param update, dispatches tall vs wide; `NS_ITERS` and `NORM_FLOOR` are constexpr params derived from dtype), `fused_power_iter` (fused H.T@H@V + QR for activation subspace tracking; `NORM_FLOOR` constexpr), `fused_agzo_perturbation` (fused AGZO perturbation: z_B projection + B@V + in-register QR + z_A projection; `NORM_FLOOR` constexpr), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one pass). Requires adapter rank >= 16 (`tl.dot` 16-wide HMMA requirement on Hopper). Uses raw pointer arithmetic only — no block pointers or experimental APIs (Triton 3.6 stability constraint).
+- **`kernels.py`** — Four H100-validated Triton kernels (161 launches/step, ~620μs total, <1% of step time): `zo_muon_update` (fused SPSA gradient + momentum + Frobenius normalize + 12-iteration minimax N-S orthogonalization + param update; dispatches tall vs wide), `fused_power_iter` (fused H.T@H@V + modified Gram-Schmidt QR for activation subspace tracking), `fused_agzo_perturbation` (fused z_B projection + BV accumulation + in-register QR + z_A projection), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one multi-CTA pass). All FP32 + allow_tf32=False (R=16 Gram products below HMMA efficiency threshold; N-S convergence requires full precision). Single-CTA grid=(1,) for kernels 1-3 (forced by serial data dependencies). Raw pointer arithmetic only (Triton 3.6.0 block-pointer stability constraint). Adapter rank >= 16 (Hopper tl.dot contraction minimum).
 - **`model_config.py`** — Model-agnostic layer discovery via `torch.device("meta")` introspection (zero memory — no weights loaded). Returns `LayerSpec` dataclass with PEFT naming conventions.
 - **`__init__.py`** — Public API exports: `DSMeZO_Controller`, `VLLMBackend`, `LayerSpec`, `discover_layers`.
 
@@ -84,7 +84,6 @@ Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"
 | `total_steps` | 1000 | Training budget |
 | `staging_dir` | `/dev/shm/ds_mezo` | Tmpfs path for adapter hot-swap |
 | `seed` | 42 | RNG seed for reproducibility |
-| `temperature` | 1.0 | Generation sampling temperature (1.0 = softmax identity) |
 | `score_fn` | None | Custom reward callable (code sets this programmatically) |
 | `resume_from` | None | Path to checkpoint dir for resuming (e.g., `output/checkpoints/step_500`) |
 
@@ -93,12 +92,11 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 - **LR**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes update unit-spectral-norm; trust-region: step ≤ perturbation radius.
 - **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
 - **r_calib**: Gavish-Donoho optimal singular value threshold via `optht` library (Marchenko-Pastur, determined once at calibration).
-- **N-S iterations**: `DEFAULT_NS_STEPS` (5) from `torch.optim._muon`. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
+- **N-S iterations**: 12 iterations (from ℓ=√ε_f32 convergence criterion, Polar Express minimax composition). 27 global-memory passes per `zo_muon_update` call. <0.2% of vLLM-dominated step time. Convergence basin and iteration count fully derived from FP32 dtype — no manual constants.
 - **Power iter steps**: `ceil(log(log(1/eps_dtype)/log(2))/log(3))` — warm-started convergence from FP32 precision.
 - **SVD power iters**: Same warm-start formula — derived from FP32 precision (replaces Halko niter=2 default).
 - **Norm floor**: `torch.finfo(torch.float32).tiny` — dtype-derived.
 - **num_candidates**: 4 (RLOO practical default — Ahmadian et al. 2024, TRL default).
-- **Temperature**: Static, user-controlled via config (default 1.0, softmax identity).
 
 ### Training flow
 
@@ -108,10 +106,10 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 
 1. **Explore**: Generate N candidates under unperturbed weights, compute RLOO advantages (leave-one-out baseline, no std normalization)
 2. **Activation tracking**: Warm-started power iteration update of per-layer activation bases
-3. **AGZO perturbation**: Project random vectors into activation subspace for B; into B's column space for A
+3. **AGZO perturbation**: Project random vectors into activation subspace for B (weighted by per-dimension momentum energy for variance reduction); into B's column space for A
 4. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
 5. **Contrastive scoring**: Score winner/loser trajectories under θ+ and θ-
-6. **ZO-Muon update**: Fused kernel applies SPSA gradient → adaptive momentum → 3-term Newton-Schulz orthogonalization (canonical Muon) → parameter update
+6. **ZO-Muon update**: Fused kernel applies SPSA gradient → adaptive momentum → minimax-optimal degree-3 Newton-Schulz orthogonalization (Polar Express) → parameter update
 7. **Schedule**: Cosine LR (eta_max = eps → 0)
 
 ## Environment
@@ -119,8 +117,7 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 - Requires NVIDIA GPU (H100 target, any CUDA GPU for tests)
 - Python 3.12+, PyTorch 2.10, Triton 3.6, vLLM 0.17.0
 - Pinned deps: `safetensors==0.7.0`, `transformers==4.56.0`, `datasets==3.5.0`, `evaluate==0.4.3`, `PyYAML==6.0.1`, `optht>=0.2.0`
-- `VLLM_ALLOW_INSECURE_SERIALIZATION=1` required (set by caller — see `scripts/launch.sh`)
-- `launch.sh` auto-detects max GPU clocks via `nvidia-smi --query-supported-clocks`, sets `OMP_NUM_THREADS` from `os.cpu_count()`, `TOKENIZERS_PARALLELISM=true`
+- Environment variables (`VLLM_ALLOW_INSECURE_SERIALIZATION`, `OMP_NUM_THREADS`, `TOKENIZERS_PARALLELISM`, `PYTORCH_CUDA_ALLOC_CONF`) set automatically by `scripts/train.py` before imports
 - vLLM `gpu_memory_utilization=0.95` hardcoded across all instantiation sites (no dynamic `mem_get_info()` calculation)
 - Activation CPU→GPU transfers use pinned memory with non-blocking DMA
 - Config files use YAML; `model_path`, `adapter_path`, and `output_dir` are required, all else defaults from `_CONFIG_DEFAULTS`
@@ -129,7 +126,7 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 
 - **PiSSA A/B swap**: PiSSA `A` maps to PEFT `lora_B.weight` and vice versa. Getting this wrong silently corrupts training. Always check which convention the current code path uses.
 - **Triton rank >= 16**: The fused kernels require adapter rank >= 16 due to Hopper HMMA tile constraints. Smaller ranks will fail at kernel launch.
-- **vLLM serialization**: `VLLM_ALLOW_INSECURE_SERIALIZATION=1` must be set or adapter loading fails silently. `launch.sh` handles this.
+- **vLLM serialization**: `VLLM_ALLOW_INSECURE_SERIALIZATION=1` must be set or adapter loading fails silently. `train.py` sets this automatically.
 - **Activation calibration**: `controller._calibrate_activation_bases_full()` must be called before `controller.train()`. Skipping it will cause runtime errors in AGZO perturbation.
 - **Checkpoint resume**: Set `resume_from` in config YAML to a checkpoint directory path (e.g., `output/checkpoints/step_500`). Calibration is skipped on resume — activation bases are restored from checkpoint.
 - **README vs CLAUDE.md commands**: The README uses direct script paths (`python scripts/prepare_pissa.py`); always use `python -m` module execution instead (`python -m scripts.prepare_pissa`).
