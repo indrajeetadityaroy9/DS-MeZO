@@ -32,11 +32,9 @@ python -m eval.grpo_baseline --model-path <path> --adapter-path <path> --output-
 
 Entry points are also available via `pyproject.toml`: `ds-mezo-train` (→ `scripts.train:main`) and `ds-mezo-pissa` (→ `scripts.prepare_pissa:main`).
 
-A minimal smoke-test config exists at `configs/smoke.yaml` (10 steps, requires PiSSA-prepared model at `/dev/shm/pissa_prep/`). Note: `smoke.yaml` omits `output_dir` — it will default to `./output`. Sample prompts at `prompts/test.jsonl`.
+A minimal smoke-test config exists at `configs/smoke.yaml` (10 steps, requires PiSSA-prepared model at `/dev/shm/pissa_prep/`, outputs to `./output`). Sample prompts at `prompts/test.jsonl`.
 
 **Prompts format**: JSONL with `{"prompt": "..."}` per line.
-
-**Note**: There is no `tests/` directory yet — evaluation is done via the `eval/` scripts.
 
 ## Architecture
 
@@ -94,7 +92,7 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 - **LR**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes update unit-spectral-norm; trust-region: step ≤ perturbation radius.
 - **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
 - **r_calib**: Gavish-Donoho optimal singular value threshold via `optht` library (Marchenko-Pastur, determined once at calibration).
-- **N-S iterations**: 3-term scalar simulation for `s_min = 1/sqrt(rank)` — derived from adapter rank and FP32 precision. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
+- **N-S iterations**: **Known bug** — `_ns_iters_for_smin()` always returns 20 (the max cap) because the Muon polynomial intentionally does not converge to 1.0 on all singular values (`p(1)=0.701≠1`). Canonical Muon uses a fixed 5 iterations (`DEFAULT_NS_STEPS`). See `AUDIT.md` BUG-2 for details. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
 - **Power iter steps**: `ceil(log(log(1/eps_dtype)/log(2))/log(3))` — warm-started convergence from FP32 precision.
 - **SVD power iters**: Same warm-start formula — derived from FP32 precision (replaces Halko niter=2 default).
 - **Norm floor**: `torch.finfo(torch.float32).tiny` — dtype-derived.
@@ -132,10 +130,12 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 - **Triton rank >= 16**: The fused kernels require adapter rank >= 16 due to Hopper HMMA tile constraints. Smaller ranks will fail at kernel launch.
 - **vLLM serialization**: `VLLM_ALLOW_INSECURE_SERIALIZATION=1` must be set or adapter loading fails silently. `launch.sh` handles this.
 - **Activation calibration**: `controller._calibrate_activation_bases_full()` must be called before `controller.train()`. Skipping it will cause runtime errors in AGZO perturbation.
+- **`optht` beta inverted**: **Known bug** — `controller.py:182` computes `beta = max(m, n) / min(m, n)` but `optht` requires `beta = min(m, n) / max(m, n)` in (0, 1]. Crashes with `ValueError` for any non-square activation matrix. See `AUDIT.md` BUG-3.
+- **RLOO div-by-zero**: **Known bug** — `rewards.std()` at `controller.py:278` returns 0 when all N candidates score identically, producing NaN that permanently corrupts momentum buffers and parameters. See `AUDIT.md` BUG-1.
+- **N-S iteration count**: **Known bug** — `_ns_iters_for_smin()` always returns 20 instead of the canonical 5. See `AUDIT.md` BUG-2.
 - **README vs CLAUDE.md commands**: The README uses direct script paths (`python scripts/prepare_pissa.py`); always use `python -m` module execution instead (`python -m scripts.prepare_pissa`).
 
 ## Design docs
 
-- **`objectives.md`** — Authoritative specification and single source of truth. Canonical mechanism-to-code mapping, execution paths, discrepancy log.
-- **`DS_MeZO_Combined.md`** — Detailed design rationale. Contains known inaccuracies documented in `objectives.md` §6. Section references (§2, §3, etc.) appear throughout the code as comments linking implementation to spec.
-- **`research_synthesis.md`** — Research context and related work survey.
+- **`AUDIT.md`** — Research audit: bugs, deviations from referenced methods, design gaps, and verified correct implementations. Prioritized action items.
+- **`resources/`** — Reference papers: `sparse_mezo/`, `ds_mezo/`, `pissa/`, `dora/`.
