@@ -132,8 +132,6 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
 
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
-        progress = self.step_count / self.total_steps
-        self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
 
     controller.step = types.MethodType(patched_step, controller)
 

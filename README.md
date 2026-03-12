@@ -148,7 +148,7 @@ The reward function is fully non-differentiable — it executes generated code a
 
 ### SFT (GSM8K)
 
-Train on GSM8K train split with NLL loss on completions. Evaluate via held-out perplexity and exact-match accuracy. Uses the same optimizer pipeline (AGZO + ZO-Muon) with `hybrid_switch_step = total_steps` (pure SFT, no RL exploration).
+Train on GSM8K train split with NLL loss on completions. Evaluate via held-out perplexity and exact-match accuracy. Uses the same optimizer pipeline (AGZO + ZO-Muon) via a standalone `sft_step()` function with NLL loss instead of RL exploration.
 
 ### Ablations
 

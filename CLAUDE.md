@@ -52,7 +52,7 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Core modules (`ds_mezo/`)
 
-- **`controller.py`** — Unified training loop. Single `step()` handles both SFT and RL via `hybrid_switch_step`. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR`, `optht`, and `torch.optim.Muon` N-S coefficients.
+- **`controller.py`** — RL training loop. Single `step()` executes the full AGZO+SPSA+ZO-Muon pipeline. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR`, `optht`, and `torch.optim.Muon` N-S coefficients.
 - **`backend.py`** — vLLM isolation layer. Handles adapter serialization (PEFT format), generation, prefill-only logprob scoring, and activation extraction via forward hooks. All vLLM-specific code lives here.
 - **`kernels.py`** — Four Hopper-native Triton kernels: `zo_muon_update` (fused gradient + momentum + Newton-Schulz + param update, dispatches tall vs wide; `NS_ITERS` and `NORM_FLOOR` are constexpr params derived from dtype), `fused_power_iter` (fused H.T@H@V + QR for activation subspace tracking; `NORM_FLOOR` constexpr), `fused_agzo_perturbation` (fused AGZO perturbation: z_B projection + B@V + in-register QR + z_A projection; `NORM_FLOOR` constexpr), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one pass). Requires adapter rank >= 16 (`tl.dot` 16-wide HMMA requirement on Hopper). Uses raw pointer arithmetic only — no block pointers or experimental APIs (Triton 3.6 stability constraint).
 - **`model_config.py`** — Model-agnostic layer discovery via `torch.device("meta")` introspection (zero memory — no weights loaded). Returns `LayerSpec` dataclass with PEFT naming conventions.
@@ -63,7 +63,7 @@ Controller (controller.py)          Backend (backend.py)
 - **`benchmarks.py`** — Standard benchmark implementations: `eval_perplexity()`, `eval_gsm8k()` (8-shot CoT), `eval_mbpp()` (zero-shot).
 - **`utils.py`** — Shared utilities: `extract_code()` (parses code blocks from LLM output), `make_exec_reward()` (closure factory returning `(reward_fn, set_problem_fn)`).
 - **`rl_bench_eval.py`** — RL proof-of-concept on MBPP: trains then evaluates.
-- **`sft_eval.py`** — SFT evaluation on GSM8K with perplexity metric.
+- **`sft_eval.py`** — SFT evaluation on GSM8K with perplexity metric. Contains standalone `sft_step()` for SFT optimization using controller internals.
 - **`ablations.py`** — 4 controlled component ablation experiments via `run_experiment()`.
 - **`grpo_baseline.py`** — GRPO backprop baseline via TRL GRPOTrainer. Same PiSSA init as DS-MeZO for controlled comparison. Requires `--dsmezo-results` path to DS-MeZO results JSON.
 
@@ -82,36 +82,37 @@ Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"
 | Field | Default | Purpose |
 |:---|:---|:---|
 | `total_steps` | 1000 | Training budget |
-| `hybrid_switch_step` | 0 | Step to switch from SFT to RL (0 = RL only) |
 | `staging_dir` | `/dev/shm/ds_mezo` | Tmpfs path for adapter hot-swap |
 | `seed` | 42 | RNG seed for reproducibility |
+| `temperature` | 1.0 | Generation sampling temperature (1.0 = softmax identity) |
 | `score_fn` | None | Custom reward callable (code sets this programmatically) |
+| `resume_from` | None | Path to checkpoint dir for resuming (e.g., `output/checkpoints/step_500`) |
 
 Self-adaptive parameters (all derived from model/dtype at init — no manual tuning):
 - **Epsilon**: `median(‖W‖_F) * eps_machine^(1/3)` (Numerical Recipes §5.7). Scale-invariant.
 - **LR**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes update unit-spectral-norm; trust-region: step ≤ perturbation radius.
 - **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
 - **r_calib**: Gavish-Donoho optimal singular value threshold via `optht` library (Marchenko-Pastur, determined once at calibration).
-- **N-S iterations**: **Known bug** — `_ns_iters_for_smin()` always returns 20 (the max cap) because the Muon polynomial intentionally does not converge to 1.0 on all singular values (`p(1)=0.701≠1`). Canonical Muon uses a fixed 5 iterations (`DEFAULT_NS_STEPS`). See `AUDIT.md` BUG-2 for details. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
+- **N-S iterations**: `DEFAULT_NS_STEPS` (5) from `torch.optim._muon`. Coefficients from `torch.optim.Muon` (PyTorch 2.10): `DEFAULT_A`, `DEFAULT_B`, `DEFAULT_C`.
 - **Power iter steps**: `ceil(log(log(1/eps_dtype)/log(2))/log(3))` — warm-started convergence from FP32 precision.
 - **SVD power iters**: Same warm-start formula — derived from FP32 precision (replaces Halko niter=2 default).
 - **Norm floor**: `torch.finfo(torch.float32).tiny` — dtype-derived.
 - **num_candidates**: 4 (RLOO practical default — Ahmadian et al. 2024, TRL default).
-- **Temperature**: Cosine decay from 1.0 (softmax identity) to 0.0 (greedy).
+- **Temperature**: Static, user-controlled via config (default 1.0, softmax identity).
 
 ### Training flow
 
 `scripts/train.py` reads `adapter_config.json` to extract rank and target modules, initializes vLLM with `max_lora_rank=max(64, rank)`, then calls `controller._calibrate_activation_bases_full()` (mandatory initialization) before `controller.train(prompts)`.
 
-### Algorithm pipeline (RL mode, one step)
+### Algorithm pipeline (one step)
 
-1. **Explore**: Generate N candidates under unperturbed weights, compute RLOO advantages
+1. **Explore**: Generate N candidates under unperturbed weights, compute RLOO advantages (leave-one-out baseline, no std normalization)
 2. **Activation tracking**: Warm-started power iteration update of per-layer activation bases
 3. **AGZO perturbation**: Project random vectors into activation subspace for B; into B's column space for A
 4. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
 5. **Contrastive scoring**: Score winner/loser trajectories under θ+ and θ-
 6. **ZO-Muon update**: Fused kernel applies SPSA gradient → adaptive momentum → 3-term Newton-Schulz orthogonalization (canonical Muon) → parameter update
-7. **Schedule**: Cosine LR (eta_max = eps → 0), cosine temperature decay to 0
+7. **Schedule**: Cosine LR (eta_max = eps → 0)
 
 ## Environment
 
@@ -130,12 +131,9 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 - **Triton rank >= 16**: The fused kernels require adapter rank >= 16 due to Hopper HMMA tile constraints. Smaller ranks will fail at kernel launch.
 - **vLLM serialization**: `VLLM_ALLOW_INSECURE_SERIALIZATION=1` must be set or adapter loading fails silently. `launch.sh` handles this.
 - **Activation calibration**: `controller._calibrate_activation_bases_full()` must be called before `controller.train()`. Skipping it will cause runtime errors in AGZO perturbation.
-- **`optht` beta inverted**: **Known bug** — `controller.py:182` computes `beta = max(m, n) / min(m, n)` but `optht` requires `beta = min(m, n) / max(m, n)` in (0, 1]. Crashes with `ValueError` for any non-square activation matrix. See `AUDIT.md` BUG-3.
-- **RLOO div-by-zero**: **Known bug** — `rewards.std()` at `controller.py:278` returns 0 when all N candidates score identically, producing NaN that permanently corrupts momentum buffers and parameters. See `AUDIT.md` BUG-1.
-- **N-S iteration count**: **Known bug** — `_ns_iters_for_smin()` always returns 20 instead of the canonical 5. See `AUDIT.md` BUG-2.
+- **Checkpoint resume**: Set `resume_from` in config YAML to a checkpoint directory path (e.g., `output/checkpoints/step_500`). Calibration is skipped on resume — activation bases are restored from checkpoint.
 - **README vs CLAUDE.md commands**: The README uses direct script paths (`python scripts/prepare_pissa.py`); always use `python -m` module execution instead (`python -m scripts.prepare_pissa`).
 
 ## Design docs
 
-- **`AUDIT.md`** — Research audit: bugs, deviations from referenced methods, design gaps, and verified correct implementations. Prioritized action items.
 - **`resources/`** — Reference papers: `sparse_mezo/`, `ds_mezo/`, `pissa/`, `dora/`.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -16,7 +17,48 @@ from vllm import LLM
 from ds_mezo.model_config import discover_layers
 from ds_mezo.backend import VLLMBackend
 from ds_mezo.controller import DSMeZO_Controller
+from ds_mezo.kernels import fused_perturb_dual, zo_muon_update
 from eval.benchmarks import eval_perplexity, eval_gsm8k
+
+
+def sft_step(ctrl: DSMeZO_Controller, sample: dict) -> None:
+    """One SFT optimization step using the controller's internals."""
+    ctrl.step_count += 1
+
+    acts = ctrl.backend.extract_activations([sample["prompt_text"]])
+    ctrl._update_activation_bases(acts)
+
+    perturbations = {l.key: ctrl._get_perturbation(l) for l in ctrl.layers}
+
+    pos_layers, neg_layers = {}, {}
+    for layer in ctrl.layers:
+        z_A, z_B = perturbations[layer.key]
+        key_A, key_B = (layer.key, "A"), (layer.key, "B")
+        fused_perturb_dual(layer.A, z_A, ctrl.pos_buffers[key_A], ctrl.neg_buffers[key_A])
+        fused_perturb_dual(layer.B, z_B, ctrl.pos_buffers[key_B], ctrl.neg_buffers[key_B])
+        pos_layers[layer.key] = (ctrl.pos_buffers[key_A], ctrl.pos_buffers[key_B])
+        neg_layers[layer.key] = (ctrl.neg_buffers[key_A], ctrl.neg_buffers[key_B])
+
+    ctrl.backend.sync_adapters(pos_layers, neg_layers, ctrl.layers)
+
+    toks, plen = sample["token_ids"], sample["prompt_len"]
+    lp_pos = ctrl.backend.score([toks], ctrl.backend.lora_pos)[0][plen:]
+    lp_neg = ctrl.backend.score([toks], ctrl.backend.lora_neg)[0][plen:]
+    dd = float((-sum(lp_pos) / len(lp_pos)) - (-sum(lp_neg) / len(lp_neg))) / (2.0 * ctrl.eps)
+
+    max_window = int(math.sqrt(ctrl.total_steps))
+    momentum = 1.0 - 1.0 / min(ctrl.step_count, max_window)
+
+    for layer in ctrl.layers:
+        z_A, z_B = perturbations[layer.key]
+        key_A, key_B = (layer.key, "A"), (layer.key, "B")
+        zo_muon_update(layer.A, ctrl.momentum_buffers[key_A], z_A, ctrl.scratch_buffers[key_A],
+                       dd, momentum, ctrl.eta, ctrl.ns_iterations, ctrl.norm_floor)
+        zo_muon_update(layer.B, ctrl.momentum_buffers[key_B], z_B, ctrl.scratch_buffers[key_B],
+                       dd, momentum, ctrl.eta, ctrl.ns_iterations, ctrl.norm_floor)
+
+    ctrl.lr_scheduler.step()
+    ctrl.eta = ctrl._lr_opt.param_groups[0]["lr"]
 
 
 def prepare_sft_data(
@@ -92,7 +134,6 @@ def main() -> None:
         "output_dir": str(args.output_dir),
         "adapter_path": str(args.adapter_path),
         "total_steps": args.total_steps,
-        "hybrid_switch_step": args.total_steps,
     })
     controller._calibrate_activation_bases_full([train_data[0]["prompt_text"]])
 
@@ -122,7 +163,7 @@ def main() -> None:
     log = []
     for step_idx in range(args.total_steps):
         sample = train_data[step_idx % len(train_data)]
-        controller.step(sample)
+        sft_step(controller, sample)
 
         entry = {
             "step": step_idx + 1,
@@ -167,7 +208,6 @@ def main() -> None:
         "training_log": log,
         "train_time_seconds": train_time,
         "total_steps": args.total_steps,
-        "hybrid_switch_step": args.total_steps,
     }
     results_path = args.output_dir / "sft_results.json"
     with open(results_path, "w") as f:

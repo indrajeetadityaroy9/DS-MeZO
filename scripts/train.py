@@ -45,7 +45,8 @@ def main() -> None:
     staging_dir = config.get("staging_dir", "/dev/shm/ds_mezo")
     backend = VLLMBackend(llm, layer_specs, rank, staging_dir=staging_dir)
     controller = DSMeZO_Controller(backend, layer_specs, config)
-    controller._calibrate_activation_bases_full([prompts[0]])
+    if not config.get("resume_from"):
+        controller._calibrate_activation_bases_full([prompts[0]])
     controller.train(prompts)
 
 

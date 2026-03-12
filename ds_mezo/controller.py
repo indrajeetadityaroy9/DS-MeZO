@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from optht import optht
 from safetensors.torch import load_file, save_file
-from torch.optim._muon import DEFAULT_A, DEFAULT_B, DEFAULT_C
+from torch.optim._muon import DEFAULT_NS_STEPS
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ds_mezo.backend import _save_peft_adapter, _write_adapter_config
@@ -24,9 +24,10 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "staging_dir": "/dev/shm/ds_mezo",
     "adapter_path": "",
     "total_steps": 1000,
-    "hybrid_switch_step": 0,
     "seed": 42,
+    "temperature": 1.0,
     "score_fn": lambda text: 0.0,
+    "resume_from": None,
 }
 
 
@@ -63,7 +64,6 @@ class DSMeZO_Controller:
         self.score_fn: Callable[[str], float] = cfg["score_fn"]
         self.step_count = 0
         self.total_steps: int = cfg["total_steps"]
-        self.hybrid_switch_step: int = cfg["hybrid_switch_step"]
 
         self.output_dir = Path(cfg["output_dir"])
         self.checkpoint_dir = self.output_dir / "checkpoints"
@@ -93,7 +93,7 @@ class DSMeZO_Controller:
         self.backend.sync_adapters({}, {}, self.layers)
 
         self.num_candidates = 4
-        self.explore_temperature = 1.0
+        self.temperature: float = cfg["temperature"]
 
         # eps = median(‖W‖_F) * eps_machine^(1/3) (Numerical Recipes §5.7)
         eps_machine = torch.finfo(torch.float32).eps
@@ -133,10 +133,7 @@ class DSMeZO_Controller:
 
         eps_dtype = torch.finfo(torch.float32).eps
 
-        # N-S iterations: 3-term scalar simulation for s_min = 1/sqrt(rank)
-        self.ns_iterations = self._ns_iters_for_smin(
-            1.0 / math.sqrt(rank), float(eps_dtype),
-        )
+        self.ns_iterations = DEFAULT_NS_STEPS
 
         # Power iteration steps: ceil(log(log(1/eps)/log(2))/log(3))
         self.power_iter_steps = math.ceil(
@@ -144,17 +141,32 @@ class DSMeZO_Controller:
         )
         self.norm_floor = torch.finfo(torch.float32).tiny
 
-    @staticmethod
-    def _ns_iters_for_smin(s_min: float, eps_dtype: float) -> int:
-        """Simulate scalar N-S map from s_min until convergence."""
-        a, b, c = DEFAULT_A, DEFAULT_B, DEFAULT_C
-        s = s_min
-        for k in range(20):
-            s2 = s * s
-            s = s * (a + b * s2 + c * s2 * s2)
-            if abs(s - 1.0) < eps_dtype:
-                return k + 1
-        return 20
+        if cfg["resume_from"] is not None:
+            self._load_checkpoint(Path(cfg["resume_from"]))
+
+    # -- Checkpoint Resume --------------------------------------------------
+
+    def _load_checkpoint(self, checkpoint_dir: Path) -> None:
+        """Restore full training state from a checkpoint directory."""
+        tensors = load_file(str(checkpoint_dir / "optimizer_state.safetensors"), device="cuda")
+
+        for layer in self.layers:
+            idx, mod = layer.layer_idx, layer.module_name
+            layer.A = tensors[f"master.layer{idx}.{mod}.A"]
+            layer.B = tensors[f"master.layer{idx}.{mod}.B"]
+            self.momentum_buffers[(layer.key, "A")] = tensors[f"momentum.layer{idx}.{mod}.A"]
+            self.momentum_buffers[(layer.key, "B")] = tensors[f"momentum.layer{idx}.{mod}.B"]
+            self.activation_bases[layer.key] = tensors[f"act_basis.layer{idx}.{mod}"]
+
+        self.rng.set_state(tensors["rng_state"])
+
+        with open(checkpoint_dir / "training_state.json") as f:
+            state = json.load(f)
+        self.step_count = state["step"]
+        self.eta = state["eta"]
+        self.temperature = state["temperature"]
+        self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        self.r_calib = self.activation_bases[self.layers[0].key].shape[1]
 
     # -- Activation Subspace Tracking (§3.5) --------------------------------
 
@@ -179,7 +191,7 @@ class DSMeZO_Controller:
             H = gpu_acts[act_id]
             sv = torch.linalg.svdvals(H).cpu().numpy()
             m, n = H.shape
-            beta = max(m, n) / min(m, n)
+            beta = min(m, n) / max(m, n)
             ranks_per_activation.append(optht(beta, sv=sv, sigma=None))
         self.r_calib = int(np.median(ranks_per_activation))
 
@@ -243,22 +255,13 @@ class DSMeZO_Controller:
 
         return loss_pos, loss_neg
 
-    def _compute_loss_sft(
-        self, token_ids: list[int], prompt_len: int,
-    ) -> tuple[float, float]:
-        """NLL on target tokens under θ+ and θ-."""
-        lp_pos = self.backend.score([token_ids], self.backend.lora_pos)[0][prompt_len:]
-        lp_neg = self.backend.score([token_ids], self.backend.lora_neg)[0][prompt_len:]
-
-        return _mean_nll(lp_pos), _mean_nll(lp_neg)
-
     def _explore(
         self, batch: list[str],
     ) -> tuple[tuple[list[int], list[int]], tuple[float, float], int]:
         """Generate candidates, compute RLOO advantages, return (trajectories, advantages, prompt_len)."""
         self.backend.sync_adapters({}, {}, self.layers)
         request_outputs = self.backend.generate(
-            batch, self.explore_temperature, self.num_candidates
+            batch, self.temperature, self.num_candidates
         )
         prompt_token_ids = request_outputs[0].prompt_token_ids
 
@@ -271,11 +274,11 @@ class DSMeZO_Controller:
         best_output, best_reward = scored[0]
         worst_output, worst_reward = scored[-1]
 
-        # RLOO advantages with REINFORCE++ normalization
+        # RLOO advantages (leave-one-out baseline)
         rewards = torch.tensor([r for _, r in scored])
         N = len(scored)
         baselines = (rewards.sum() - rewards) / (N - 1)
-        advantages = (rewards - baselines) / rewards.std()
+        advantages = rewards - baselines
         adv_w = float(advantages[0])   # best (sorted descending)
         adv_l = float(advantages[-1])  # worst
 
@@ -285,15 +288,12 @@ class DSMeZO_Controller:
 
         return (winner_full, loser_full), (adv_w, adv_l), prompt_len
 
-    def step(self, batch: list[str] | dict[str, Any]) -> None:
+    def step(self, batch: list[str]) -> None:
         self.step_count += 1
-        use_rl_loss = self.step_count > self.hybrid_switch_step
 
-        if use_rl_loss:
-            trajectories, advantages, prompt_len = self._explore(batch)
+        trajectories, advantages, prompt_len = self._explore(batch)
 
-        input_for_activations = batch if isinstance(batch, list) else [batch["prompt_text"]]
-        batch_activations = self.backend.extract_activations(input_for_activations)
+        batch_activations = self.backend.extract_activations(batch)
         self._update_activation_bases(batch_activations)
 
         perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -313,10 +313,7 @@ class DSMeZO_Controller:
 
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
 
-        if use_rl_loss:
-            loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
-        else:
-            loss_pos, loss_neg = self._compute_loss_sft(batch["token_ids"], batch["prompt_len"])
+        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
 
         dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
 
@@ -338,30 +335,19 @@ class DSMeZO_Controller:
 
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
-        if use_rl_loss:
-            progress = self.step_count / self.total_steps
-            self.explore_temperature = 0.5 * (1 + math.cos(math.pi * progress))
 
-    def train(
-        self,
-        rl_data: list[str],
-        sft_data: list[dict[str, Any]] | None = None,
-    ) -> None:
+    def train(self, prompts: list[str]) -> None:
         log_interval = self.total_steps // 100
         ckpt_interval = self.total_steps // 10
 
         for step_idx in range(self.step_count, self.total_steps):
-            if step_idx < self.hybrid_switch_step:
-                batch = sft_data[step_idx % len(sft_data)]
-            else:
-                batch = [rl_data[(step_idx - self.hybrid_switch_step) % len(rl_data)]]
+            batch = [prompts[step_idx % len(prompts)]]
             self.step(batch)
 
             if (step_idx + 1) % log_interval == 0:
                 print(
                     f"step={step_idx + 1}/{self.total_steps} "
-                    f"lr={self.eta:.2e} "
-                    f"temp={self.explore_temperature:.3f}"
+                    f"lr={self.eta:.2e}"
                 )
 
             if (step_idx + 1) % ckpt_interval == 0:
@@ -395,7 +381,8 @@ class DSMeZO_Controller:
         training_state = {
             "step": step,
             "eta": self.eta,
-            "explore_temperature": self.explore_temperature,
+            "temperature": self.temperature,
+            "lr_scheduler": self.lr_scheduler.state_dict(),
         }
         with open(step_dir / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2)
