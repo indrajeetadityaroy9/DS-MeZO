@@ -115,7 +115,7 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 ## Environment
 
 - Requires NVIDIA GPU (H100 target, any CUDA GPU for tests)
-- Python 3.12+, PyTorch 2.10, Triton 3.6, vLLM 0.17.0
+- Python 3.12+, PyTorch 2.10, Triton 3.6, vLLM 0.17.1
 - Pinned deps: `safetensors==0.7.0`, `transformers==4.56.0`, `datasets==3.5.0`, `evaluate==0.4.3`, `PyYAML==6.0.1`, `optht>=0.2.0`
 - Environment variables (`VLLM_ALLOW_INSECURE_SERIALIZATION`, `OMP_NUM_THREADS`, `TOKENIZERS_PARALLELISM`, `PYTORCH_CUDA_ALLOC_CONF`) set automatically by `scripts/train.py` before imports
 - vLLM `gpu_memory_utilization=0.95` hardcoded across all instantiation sites (no dynamic `mem_get_info()` calculation)
