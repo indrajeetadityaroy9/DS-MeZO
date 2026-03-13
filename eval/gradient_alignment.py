@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 import types
 from pathlib import Path
@@ -13,14 +12,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from peft import PeftConfig, PeftModel
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ds_mezo.model_config import discover_layers
-from ds_mezo.backend import VLLMBackend, create_engine
 from ds_mezo.controller import DSMeZO_Controller
-from eval.benchmarks import load_mbpp_train
-from eval.utils import make_exec_reward
+from eval.benchmarks import load_mbpp_train, make_exec_reward, setup_controller
 
 
 def _compute_bp_gradient(
@@ -59,20 +55,14 @@ def _compute_bp_gradient(
     outputs = model(**inputs, labels=labels)
     outputs.loss.backward()
 
+    param_map = {name: param for name, param in model.named_parameters()}
     gradients: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
     for spec in layer_specs:
         key = (spec.layer_idx, spec.module_name)
-        lora_a_key = f"{spec.peft_prefix}.lora_A.weight"
-        lora_b_key = f"{spec.peft_prefix}.lora_B.weight"
-        grad_B_peft = None
-        grad_A_peft = None
-        for name, param in model.named_parameters():
-            if name == lora_a_key and param.grad is not None:
-                grad_B_peft = param.grad.clone()  # lora_A = B (PiSSA swap)
-            elif name == lora_b_key and param.grad is not None:
-                grad_A_peft = param.grad.clone()  # lora_B = A (PiSSA swap)
-        if grad_A_peft is not None and grad_B_peft is not None:
-            gradients[key] = (grad_A_peft, grad_B_peft)
+        # PiSSA swap: lora_A = B, lora_B = A
+        grad_B = param_map[f"{spec.peft_prefix}.lora_A.weight"].grad.clone()
+        grad_A = param_map[f"{spec.peft_prefix}.lora_B.weight"].grad.clone()
+        gradients[key] = (grad_A, grad_B)
 
     del model
     return gradients
@@ -90,89 +80,46 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
-    rank = peft_config.r
-    target_modules = list(peft_config.target_modules)
-
     train_data = load_mbpp_train()
     probe_steps = set(args.probe_steps)
+
+    reward, set_problem = make_exec_reward()
+    llm, backend, controller, rank, layer_specs = setup_controller(
+        args.model_path, args.adapter_path, args.output_dir, args.total_steps,
+        score_fn=reward, calibration_prompt=train_data[0]["prompt"],
+    )
 
     print("=" * 70)
     print("GRADIENT ALIGNMENT DIAGNOSTIC")
     print(f"Probe steps: {sorted(probe_steps)}")
     print("=" * 70)
 
-    print("\nLoading vLLM engine...")
-    llm = create_engine(args.model_path, rank)
-
-    reward, set_problem = make_exec_reward()
-    layer_specs = discover_layers(args.model_path, target_modules)
-    backend = VLLMBackend(llm, layer_specs, rank)
-    controller = DSMeZO_Controller(backend, layer_specs, {
-        "output_dir": str(args.output_dir),
-        "adapter_path": str(args.adapter_path),
-        "score_fn": reward,
-        "total_steps": args.total_steps,
-    })
-    controller._calibrate_activation_bases_full([train_data[0]["prompt"]])
-
     # Storage for captured ZO gradients at probe steps
     captured: dict[str, Any] = {}
-
-    original_step = controller.step
 
     def capturing_step(self, batch):
         """Wrapper that captures dd and perturbations before the update."""
         self.step_count += 1
-        step = self.step_count
-
         trajectories, advantages, prompt_len = self._explore(batch)
-        batch_activations = self.backend.extract_activations(batch)
-        self._update_activation_bases(batch_activations)
 
-        perturbations = {}
-        for layer in self.layers:
-            perturbations[layer.key] = self._get_perturbation(layer)
+        # Dynamic sampling: skip when advantages are below SPSA truncation floor
+        if max(abs(a) for a in advantages) < self.eps:
+            self.lr_scheduler.step()
+            self.eta = self._lr_opt.param_groups[0]["lr"]
+            return
 
-        from ds_mezo.kernels import fused_perturb_dual
-        pos_layers, neg_layers = {}, {}
-        for layer in self.layers:
-            z_A, z_B = perturbations[layer.key]
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
-            fused_perturb_dual(layer.A, z_A, self.pos_buffers[key_A], self.neg_buffers[key_A])
-            fused_perturb_dual(layer.B, z_B, self.pos_buffers[key_B], self.neg_buffers[key_B])
-            pos_layers[layer.key] = (self.pos_buffers[key_A], self.pos_buffers[key_B])
-            neg_layers[layer.key] = (self.neg_buffers[key_A], self.neg_buffers[key_B])
-
-        self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
+        perturbations = self._perturb_and_sync(batch)
         loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
         dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
 
-        if step in probe_steps:
-            captured[step] = {
+        if self.step_count in probe_steps:
+            captured[self.step_count] = {
                 "dd": dd,
                 "perturbations": {k: (zA.clone(), zB.clone()) for k, (zA, zB) in perturbations.items()},
                 "prompt": batch[0],
             }
 
-        # Continue with the actual update
-        from ds_mezo.kernels import zo_muon_update
-        max_window = int(math.sqrt(self.total_steps))
-        momentum = 1.0 - 1.0 / min(self.step_count, max_window)
-        for layer in self.layers:
-            z_A, z_B = perturbations[layer.key]
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
-            zo_muon_update(layer.A, self.momentum_buffers[key_A],
-                           z_A, self.scratch_buffers[key_A],
-                           dd, momentum, self.eta, self.norm_floor)
-            zo_muon_update(layer.B, self.momentum_buffers[key_B],
-                           z_B, self.scratch_buffers[key_B],
-                           dd, momentum, self.eta, self.norm_floor)
-
-        self.lr_scheduler.step()
-        self.eta = self._lr_opt.param_groups[0]["lr"]
+        self._update_weights(perturbations, dd)
 
     controller.step = types.MethodType(capturing_step, controller)
 
@@ -228,7 +175,7 @@ def main() -> None:
 
         # Aggregate across layers
         all_cos = list(step_result["cosine_sim"].values())
-        step_result["mean_cosine_sim"] = sum(all_cos) / len(all_cos) if all_cos else 0.0
+        step_result["mean_cosine_sim"] = sum(all_cos) / len(all_cos)
         alignment_results.append(step_result)
 
         print(f"    Mean cosine similarity: {step_result['mean_cosine_sim']:.4f}")

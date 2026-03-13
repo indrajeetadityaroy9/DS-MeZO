@@ -106,10 +106,7 @@ python -m scripts.prepare_pissa --model meta-llama/Llama-3.1-8B --output /dev/sh
 # 2. RL post-training evaluation (MBPP pass@1, execution-based reward)
 python -m eval.rl_bench_eval --model-path /dev/shm/pissa_prep/residual --adapter-path /dev/shm/pissa_prep/adapter --output-dir output/rl
 
-# 3. SFT evaluation (GSM8K perplexity)
-python -m eval.sft_eval --model-path /dev/shm/pissa_prep/residual --adapter-path /dev/shm/pissa_prep/adapter --output-dir output/sft
-
-# 4. Component ablation experiments
+# 3. Component ablation experiments
 python -m eval.ablations --model-path /dev/shm/pissa_prep/residual --adapter-path /dev/shm/pissa_prep/adapter --output-dir output/ablations
 ```
 
@@ -124,11 +121,10 @@ ds_mezo/
   model_config.py  — Layer discovery via meta-device introspection
 
 eval/
-  benchmarks.py    — Standard benchmarks (MBPP, HumanEval, GSM8K, perplexity)
+  benchmarks.py    — Standard benchmarks (MBPP, HumanEval, SST-2, RTE, LiveCodeBench)
   utils.py         — Shared utilities (extract_code, pass_at_k, make_exec_reward)
   rl_bench_eval.py — RL post-training proof-of-concept (MBPP)
-  sft_eval.py      — SFT evaluation (GSM8K)
-  ablations.py     — Component ablation experiments (4 controlled experiments)
+  ablations.py     — Component ablation experiments (8 controlled experiments)
   grpo_baseline.py — GRPO backprop baseline via TRL (comparative evaluation)
 
 scripts/
@@ -143,10 +139,6 @@ scripts/
 Train on MBPP sanitized train split (120 problems, 1000 steps) with execution-based reward (fraction of test assertions passing). Evaluate on MBPP sanitized test split (257 problems) via `evaluate.code_eval` pass@1.
 
 The reward function is fully non-differentiable — it executes generated code against test cases and counts passing assertions. No approximation or reward model required.
-
-### SFT (GSM8K)
-
-Train on GSM8K train split with NLL loss on completions. Evaluate via held-out perplexity and exact-match accuracy. Uses the same optimizer pipeline (AGZO + ZO-Muon) via a standalone `sft_step()` function with NLL loss instead of RL exploration.
 
 ### Ablations
 

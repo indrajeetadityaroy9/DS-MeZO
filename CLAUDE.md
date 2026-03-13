@@ -23,7 +23,6 @@ python -m scripts.train --config <config.yaml> --prompts <prompts.jsonl>
 
 # Evaluation scripts (each requires GPU + PiSSA-prepared model)
 python -m eval.rl_bench_eval --model-path <path> --adapter-path <path> --output-dir <path>
-python -m eval.sft_eval --model-path <path> --adapter-path <path> --output-dir <path>
 python -m eval.ablations --model-path <path> --adapter-path <path> --output-dir <path>
 
 # GRPO baseline (all dependencies in core install)
@@ -52,19 +51,18 @@ Controller (controller.py)          Backend (backend.py)
 
 ### Core modules (`ds_mezo/`)
 
-- **`controller.py`** — RL training loop. Single `step()` executes the full AGZO+SPSA+ZO-Muon pipeline. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR` and `optht`. Momentum-weighted AGZO perturbation (P-GAP-inspired variance reduction).
+- **`controller.py`** — RL training loop implementing BSCO (Bayesian Subspace Contrastive Optimization). Single `step()` executes: shrinkage RLOO → dynamic sampling → AGZO perturbation → contrastive scoring → diagonal Kalman update → ZO-Muon spectral optimization. Config via `{**_CONFIG_DEFAULTS, **config}` dict merge. Layer state via `LayerState` dataclass. Algorithm-only — no vLLM imports. Uses `CosineAnnealingLR` and `optht`. Variance-weighted AGZO perturbation (DAP-optimal via Kalman posterior variance).
 - **`backend.py`** — vLLM isolation layer. Handles adapter serialization (PEFT format), generation, prefill-only logprob scoring, and activation extraction via forward hooks. All vLLM-specific code lives here.
-- **`kernels.py`** — Four H100-validated Triton kernels (161 launches/step, ~620μs total, <1% of step time): `zo_muon_update` (fused SPSA gradient + momentum + Frobenius normalize + 12-iteration minimax N-S orthogonalization + param update; dispatches tall vs wide), `fused_power_iter` (fused H.T@H@V + modified Gram-Schmidt QR for activation subspace tracking), `fused_agzo_perturbation` (fused z_B projection + BV accumulation + in-register QR + z_A projection), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one multi-CTA pass). All FP32 + allow_tf32=False (R=16 Gram products below HMMA efficiency threshold; N-S convergence requires full precision). Single-CTA grid=(1,) for kernels 1-3 (forced by serial data dependencies). Raw pointer arithmetic only (Triton 3.6.0 block-pointer stability constraint). Adapter rank >= 16 (Hopper tl.dot contraction minimum).
+- **`kernels.py`** — Four H100-validated Triton kernels (161 launches/step, ~620μs total, <1% of step time): `zo_muon_update` (Frobenius normalize + 12-iteration minimax N-S orthogonalization + param update; Kalman gradient estimation runs in Python before kernel call; dispatches tall vs wide), `fused_power_iter` (fused H.T@H@V + modified Gram-Schmidt QR for activation subspace tracking), `fused_agzo_perturbation` (fused z_B projection + BV accumulation + in-register QR + z_A projection), `fused_perturb_dual` (θ+=base+z, θ-=base-z in one multi-CTA pass). All FP32 + allow_tf32=False (R=16 Gram products below HMMA efficiency threshold; N-S convergence requires full precision). Single-CTA grid=(1,) for kernels 1-3 (forced by serial data dependencies). Raw pointer arithmetic only (Triton 3.6.0 block-pointer stability constraint). Adapter rank >= 16 (Hopper tl.dot contraction minimum).
 - **`model_config.py`** — Model-agnostic layer discovery via `torch.device("meta")` introspection (zero memory — no weights loaded). Returns `LayerSpec` dataclass with PEFT naming conventions.
 - **`__init__.py`** — Public API exports: `DSMeZO_Controller`, `VLLMBackend`, `LayerSpec`, `discover_layers`.
 
 ### Eval modules (`eval/`)
 
-- **`benchmarks.py`** — Standard benchmark implementations: `eval_perplexity()`, `eval_gsm8k()` (8-shot CoT), `eval_mbpp()` (zero-shot).
+- **`benchmarks.py`** — Standard benchmark implementations: `eval_mbpp()` (zero-shot), `eval_humaneval()`, `eval_sst2()`, `eval_rte()`, `eval_livecodebench()`.
 - **`utils.py`** — Shared utilities: `extract_code()` (parses code blocks from LLM output), `make_exec_reward()` (closure factory returning `(reward_fn, set_problem_fn)`).
 - **`rl_bench_eval.py`** — RL proof-of-concept on MBPP: trains then evaluates.
-- **`sft_eval.py`** — SFT evaluation on GSM8K with perplexity metric. Contains standalone `sft_step()` for SFT optimization using controller internals.
-- **`ablations.py`** — 4 controlled component ablation experiments via `run_experiment()`.
+- **`ablations.py`** — 8 controlled component ablation experiments via `run_experiment()`. Includes BSCO-specific ablations: `no_kalman` (EMA momentum + N-S, pre-BSCO behavior), `no_shrinkage` (vanilla RLOO).
 - **`grpo_baseline.py`** — GRPO backprop baseline via TRL GRPOTrainer. Same PiSSA init as DS-MeZO for controlled comparison. Requires `--dsmezo-results` path to DS-MeZO results JSON.
 
 ### Key conventions
@@ -90,7 +88,7 @@ Required in practice: `model_path`, `adapter_path`, `output_dir` (has default `"
 Self-adaptive parameters (all derived from model/dtype at init — no manual tuning):
 - **Epsilon**: `median(‖W‖_F) * eps_machine^(1/3)` (Numerical Recipes §5.7). Scale-invariant.
 - **LR**: `eta_max = eps`, cosine decay to 0 via `torch.optim.lr_scheduler.CosineAnnealingLR`. N-S normalization makes update unit-spectral-norm; trust-region: step ≤ perturbation radius.
-- **Momentum**: `1 - 1/min(step, √total_steps)` — EMA window ramps from 1 to √T. Gives final momentum 0.968 for T=1000, 0.99 for T=10000.
+- **β (Kalman prediction decay)**: `1 - 1/min(step, √total_steps)` — same schedule as legacy momentum. Drives Kalman prediction step and reward EMA. Process noise `q = ε²·(1-β²)`, variance initialized to `ε²`.
 - **r_calib**: Gavish-Donoho optimal singular value threshold via `optht` library (Marchenko-Pastur, determined once at calibration).
 - **N-S iterations**: 12 iterations (from ℓ=√ε_f32 convergence criterion, Polar Express minimax composition). 27 global-memory passes per `zo_muon_update` call. <0.2% of vLLM-dominated step time. Convergence basin and iteration count fully derived from FP32 dtype — no manual constants.
 - **Power iter steps**: `ceil(log(log(1/eps_dtype)/log(2))/log(3))` — warm-started convergence from FP32 precision.
@@ -102,15 +100,17 @@ Self-adaptive parameters (all derived from model/dtype at init — no manual tun
 
 `scripts/train.py` reads `adapter_config.json` to extract rank and target modules, initializes vLLM with `max_lora_rank=max(64, rank)`, then calls `controller._calibrate_activation_bases_full()` (mandatory initialization) before `controller.train(prompts)`.
 
-### Algorithm pipeline (one step)
+### Algorithm pipeline (one step — BSCO)
 
-1. **Explore**: Generate N candidates under unperturbed weights, compute RLOO advantages (leave-one-out baseline, no std normalization)
-2. **Activation tracking**: Warm-started power iteration update of per-layer activation bases
-3. **AGZO perturbation**: Project random vectors into activation subspace for B (weighted by per-dimension momentum energy for variance reduction); into B's column space for A
-4. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
-5. **Contrastive scoring**: Score winner/loser trajectories under θ+ and θ-
-6. **ZO-Muon update**: Fused kernel applies SPSA gradient → adaptive momentum → minimax-optimal degree-3 Newton-Schulz orthogonalization (Polar Express) → parameter update
-7. **Schedule**: Cosine LR (eta_max = eps → 0)
+1. **Explore**: Generate N candidates under unperturbed weights, compute shrinkage RLOO advantages (James-Stein optimal baseline with reward EMA)
+2. **Dynamic sampling**: If max(|advantage|) < ε, skip step (SPSA truncation-dominated). Step LR scheduler regardless.
+3. **Activation tracking**: Warm-started power iteration update of per-layer activation bases
+4. **AGZO perturbation**: Project random vectors into activation subspace for B (weighted by Kalman posterior variance — DAP-optimal); into B's column space for A
+5. **Dual perturbation**: Fused kernel computes θ+ = base + εz and θ- = base - εz
+6. **Contrastive scoring**: Score all N candidates under θ+ and θ- (advantage-weighted NLL)
+7. **Kalman update**: Diagonal Kalman filter prediction + observation update on gradient posterior (Python). Posterior mean μ replaces momentum buffer.
+8. **ZO-Muon update**: Fused kernel applies Frobenius normalize → minimax-optimal degree-3 Newton-Schulz orthogonalization (Polar Express) → parameter update
+9. **Schedule**: Cosine LR (eta_max = eps → 0)
 
 ## Environment
 

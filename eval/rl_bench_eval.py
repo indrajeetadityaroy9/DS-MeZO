@@ -8,16 +8,11 @@ import json
 import time
 from pathlib import Path
 
-from peft import PeftConfig
-
-from ds_mezo.model_config import discover_layers
-from ds_mezo.backend import VLLMBackend, create_engine
-from ds_mezo.controller import DSMeZO_Controller
 from eval.benchmarks import (
     eval_mbpp, eval_humaneval, eval_sst2, eval_rte,
     load_mbpp_train, load_apps_train,
+    make_exec_reward, setup_controller,
 )
-from eval.utils import make_exec_reward
 
 
 def _run_full_eval(llm, lora_request, n_samples, temperature):
@@ -65,10 +60,6 @@ def main() -> None:
     model_name = args.model_path.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
-    rank = peft_config.r
-    target_modules = list(peft_config.target_modules)
-
     if args.train_data == "apps":
         train_data = load_apps_train()
     else:
@@ -80,6 +71,12 @@ def main() -> None:
         eval_at_steps = set(args.eval_at_steps)
         total_steps = max(max(eval_at_steps), total_steps)
 
+    reward, set_problem = make_exec_reward()
+    llm, backend, controller, rank, _ = setup_controller(
+        args.model_path, args.adapter_path, args.output_dir, total_steps,
+        score_fn=reward, calibration_prompt=train_data[0]["prompt"],
+    )
+
     print("=" * 70)
     print("DS-MeZO RL PROOF-OF-CONCEPT")
     print(f"Model: {model_name} | PiSSA rank-{rank}")
@@ -88,22 +85,6 @@ def main() -> None:
     if eval_at_steps:
         print(f"Scaling checkpoints: {sorted(eval_at_steps)}")
     print("=" * 70)
-
-    print("\nLoading vLLM engine...")
-    t0 = time.time()
-    llm = create_engine(args.model_path, rank)
-    print(f"Engine loaded in {time.time()-t0:.1f}s")
-
-    reward, set_problem = make_exec_reward()
-    layer_specs = discover_layers(args.model_path, target_modules)
-    backend = VLLMBackend(llm, layer_specs, rank)
-    controller = DSMeZO_Controller(backend, layer_specs, {
-        "output_dir": str(args.output_dir),
-        "adapter_path": str(args.adapter_path),
-        "score_fn": reward,
-        "total_steps": total_steps,
-    })
-    controller._calibrate_activation_bases_full([train_data[0]["prompt"]])
 
     controller.backend.sync_adapters({}, {}, controller.layers)
     pre_results = _run_full_eval(llm, backend.lora_pos, args.n_samples, args.temperature)

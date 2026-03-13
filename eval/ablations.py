@@ -12,13 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-from peft import PeftConfig
-
-from ds_mezo.model_config import LayerSpec, discover_layers
-from ds_mezo.backend import VLLMBackend, create_engine
+from ds_mezo.model_config import LayerSpec
 from ds_mezo.controller import DSMeZO_Controller, LayerState
-from eval.utils import make_exec_reward
-from eval.benchmarks import eval_mbpp, load_mbpp_train, load_apps_train
+from eval.benchmarks import (
+    make_exec_reward, eval_mbpp, load_mbpp_train, load_apps_train,
+    load_adapter_config, setup_controller,
+)
 
 
 def run_experiment(
@@ -39,15 +38,12 @@ def run_experiment(
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     reward, set_problem = make_exec_reward()
-    config = {
-        "output_dir": str(experiment_dir),
-        "adapter_path": str(adapter_path),
-        "total_steps": total_steps,
-        "score_fn": reward,
-    }
 
-    backend = VLLMBackend(llm, layer_specs, rank)
-    controller = DSMeZO_Controller(backend, layer_specs, config)
+    _, backend, controller, _, _ = setup_controller(
+        model_path=None, adapter_path=adapter_path,
+        output_dir=experiment_dir, total_steps=total_steps,
+        score_fn=reward, engine=llm, layer_specs=layer_specs, rank=rank,
+    )
 
     free, total = torch.cuda.mem_get_info()
     mem_after_init = (total - free) / (1024 ** 3)
@@ -92,55 +88,22 @@ def run_experiment(
 # ── Monkey-patch functions ──────────────────────────────────────────────────
 
 def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
-    """Replace ZO-Muon (N-S orthogonalization) with plain SGD+momentum."""
+    """Replace BSCO (Kalman + N-S) with plain SGD+momentum."""
 
-    def patched_step(self: DSMeZO_Controller, batch: list[str]) -> None:
-        self.step_count += 1
-
-        trajectories, advantages, prompt_len = self._explore(batch)
-
-        batch_activations = self.backend.extract_activations(batch)
-        self._update_activation_bases(batch_activations)
-
-        perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer in self.layers:
-            perturbations[layer.key] = self._get_perturbation(layer)
-
-        pos_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
-        neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer in self.layers:
-            z_A, z_B = perturbations[layer.key]
-            pos_A = layer.A + z_A
-            neg_A = layer.A - z_A
-            pos_B = layer.B + z_B
-            neg_B = layer.B - z_B
-            pos_layers[layer.key] = (pos_A, pos_B)
-            neg_layers[layer.key] = (neg_A, neg_B)
-
-        self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
-        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
-
-        dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
-
+    def sgd_update(self, perturbations, dd):
         max_window = int(math.sqrt(self.total_steps))
-        mom = 1.0 - 1.0 / min(self.step_count, max_window)
-
+        self._momentum = 1.0 - 1.0 / min(self.step_count, max_window)
+        mom = self._momentum
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
-            grad_A = dd * z_A
-            self.momentum_buffers[key_A].mul_(mom).add_((1 - mom) * grad_A)
-            layer.A.sub_(self.eta * self.momentum_buffers[key_A])
-
-            grad_B = dd * z_B
-            self.momentum_buffers[key_B].mul_(mom).add_((1 - mom) * grad_B)
-            layer.B.sub_(self.eta * self.momentum_buffers[key_B])
-
+            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
+                key = (layer.key, suffix)
+                self.momentum_buffers[key].mul_(mom).add_((1 - mom) * dd * z_mat)
+                param.sub_(self.eta * self.momentum_buffers[key])
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
 
-    controller.step = types.MethodType(patched_step, controller)
+    controller._update_weights = types.MethodType(sgd_update, controller)
 
 
 def patch_random_perturbation(controller: DSMeZO_Controller) -> None:
@@ -174,6 +137,57 @@ def patch_static_bases(controller: DSMeZO_Controller) -> None:
     )
 
 
+def patch_no_kalman(controller: DSMeZO_Controller) -> None:
+    """Replace Kalman with EMA momentum + N-S kernel (pre-BSCO behavior)."""
+    from ds_mezo.kernels import zo_muon_update
+
+    def ema_update(self, perturbations, dd):
+        max_window = int(math.sqrt(self.total_steps))
+        self._momentum = 1.0 - 1.0 / min(self.step_count, max_window)
+        mom = self._momentum
+        for layer in self.layers:
+            z_A, z_B = perturbations[layer.key]
+            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
+                key = (layer.key, suffix)
+                buf = self.momentum_buffers[key]
+                buf.mul_(mom).add_((1 - mom) * dd * z_mat)
+                zo_muon_update(param, buf, self.scratch_buffers[key], self.eta, self.norm_floor)
+        self.lr_scheduler.step()
+        self.eta = self._lr_opt.param_groups[0]["lr"]
+
+    controller._update_weights = types.MethodType(ema_update, controller)
+
+
+def patch_no_shrinkage(controller: DSMeZO_Controller) -> None:
+    """Replace shrinkage RLOO with vanilla RLOO (pre-BSCO behavior)."""
+
+    def vanilla_explore(self, batch):
+        self.backend.sync_adapters({}, {}, self.layers)
+        request_outputs = self.backend.generate(
+            batch, self.temperature, self.num_candidates
+        )
+        prompt_token_ids = request_outputs[0].prompt_token_ids
+
+        scored = [
+            (out, self.score_fn(out.text))
+            for out in request_outputs[0].outputs
+        ]
+
+        rewards = torch.tensor([r for _, r in scored])
+        N = len(scored)
+        baselines = (rewards.sum() - rewards) / (N - 1)
+        advantages = [float(a) for a in (rewards - baselines)]
+
+        trajectories = [
+            list(prompt_token_ids) + list(out.token_ids) for out, _ in scored
+        ]
+        prompt_len = len(prompt_token_ids)
+
+        return trajectories, advantages, prompt_len
+
+    controller._explore = types.MethodType(vanilla_explore, controller)
+
+
 def patch_mezo(controller: DSMeZO_Controller) -> None:
     """MeZO baseline: vanilla ZO-SGD on PiSSA. No AGZO, no ZO-Muon, no activation tracking."""
     patch_sgd_momentum(controller)
@@ -191,6 +205,7 @@ def patch_lora_init(controller: DSMeZO_Controller) -> None:
         norms.append(torch.linalg.norm(layer.A).item())
         for key in [(layer.key, "A"), (layer.key, "B")]:
             controller.momentum_buffers[key].zero_()
+            controller.variance_buffers[key].fill_(controller.eps ** 2)
     controller.eps = float(torch.tensor(norms).median()) * eps_dtype ** (1.0 / 3.0)
 
 
@@ -207,6 +222,8 @@ EXPERIMENTS: list[dict[str, Any]] = [
     {"name": "no_agzo",       "patch": patch_random_perturbation},
     {"name": "static_bases",  "patch": patch_static_bases},
     {"name": "lora_init",     "patch": patch_lora_init},
+    {"name": "no_kalman",     "patch": patch_no_kalman},
+    {"name": "no_shrinkage",  "patch": patch_no_shrinkage},
 ]
 
 
@@ -225,9 +242,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
-    rank = peft_config.r
-    target_modules = list(peft_config.target_modules)
+    rank, target_modules = load_adapter_config(args.adapter_path)
 
     if args.train_data == "apps":
         train_data = load_apps_train()
@@ -238,6 +253,9 @@ def main() -> None:
     if args.experiments:
         exp_names = set(args.experiments)
         experiments = [e for e in EXPERIMENTS if e["name"] in exp_names]
+
+    from ds_mezo.backend import create_engine
+    from ds_mezo.model_config import discover_layers
 
     print("=" * 70)
     print("DS-MeZO ABLATION EVALUATION")

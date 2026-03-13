@@ -1,4 +1,8 @@
-"""DS-MeZO Controller: AGZO + SPSA + ZO-Muon zeroth-order optimizer."""
+"""DS-MeZO Controller: BSCO — Bayesian Subspace Contrastive Optimization.
+
+Diagonal Kalman filter replaces momentum EMA for gradient estimation.
+Posterior variance drives perturbation sampling. Shrinkage RLOO for
+advantage estimation. Full candidate scoring. Dynamic sampling."""
 
 from __future__ import annotations
 
@@ -92,6 +96,8 @@ class DSMeZO_Controller:
 
         self.num_candidates = 4
         self.temperature = 1.0
+        self.reward_ema = 0.0
+        self._momentum = 0.0
 
         # eps = median(‖W‖_F) * eps_machine^(1/3) (Numerical Recipes §5.7)
         eps_machine = torch.finfo(torch.float32).eps
@@ -109,6 +115,7 @@ class DSMeZO_Controller:
         )
 
         self.momentum_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
+        self.variance_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.scratch_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.pos_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         self.neg_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
@@ -117,6 +124,8 @@ class DSMeZO_Controller:
             key_B = (layer.key, "B")
             self.momentum_buffers[key_A] = torch.zeros_like(layer.A)
             self.momentum_buffers[key_B] = torch.zeros_like(layer.B)
+            self.variance_buffers[key_A] = torch.full_like(layer.A, self.eps ** 2)
+            self.variance_buffers[key_B] = torch.full_like(layer.B, self.eps ** 2)
             self.scratch_buffers[key_A] = torch.zeros_like(layer.A)
             self.scratch_buffers[key_B] = torch.zeros_like(layer.B)
             self.pos_buffers[key_A] = torch.empty_like(layer.A)
@@ -152,6 +161,8 @@ class DSMeZO_Controller:
             layer.B = tensors[f"master.layer{idx}.{mod}.B"]
             self.momentum_buffers[(layer.key, "A")] = tensors[f"momentum.layer{idx}.{mod}.A"]
             self.momentum_buffers[(layer.key, "B")] = tensors[f"momentum.layer{idx}.{mod}.B"]
+            self.variance_buffers[(layer.key, "A")] = tensors[f"variance.layer{idx}.{mod}.A"]
+            self.variance_buffers[(layer.key, "B")] = tensors[f"variance.layer{idx}.{mod}.B"]
             self.activation_bases[layer.key] = tensors[f"act_basis.layer{idx}.{mod}"]
 
         self.rng.set_state(tensors["rng_state"])
@@ -160,6 +171,7 @@ class DSMeZO_Controller:
             state = json.load(f)
         self.step_count = state["step"]
         self.eta = state["eta"]
+        self.reward_ema = state["reward_ema"]
         self.lr_scheduler.load_state_dict(state["lr_scheduler"])
         self.r_calib = self.activation_bases[self.layers[0].key].shape[1]
 
@@ -218,18 +230,16 @@ class DSMeZO_Controller:
     # -- Perturbation (§3.2) ------------------------------------------------
 
     def _get_perturbation(self, layer: LayerState) -> tuple[torch.Tensor, torch.Tensor]:
-        """AGZO subspace perturbation with momentum-informed weighting."""
+        """AGZO subspace perturbation with variance-weighted sampling (DAP-optimal)."""
         A, B = layer.A, layer.B
         V_l = self.activation_bases[layer.key]
 
+        # Variance-weighted B perturbation: sample proportional to posterior uncertainty
+        var_B = self.variance_buffers[(layer.key, "B")]
+        var_B_proj = var_B @ (V_l ** 2)  # (r, r_calib), always non-negative
         z_coeff_B = torch.randn(
             B.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
-        )
-        M_B = self.momentum_buffers[(layer.key, "B")]
-        M_proj = M_B @ V_l  # (r, r_calib) — momentum in activation coords
-        col_energies = torch.linalg.norm(M_proj, dim=0)  # (r_calib,)
-        scale = col_energies / (col_energies.mean() + self.norm_floor)
-        z_coeff_B = z_coeff_B * (1 + scale[None, :])
+        ) * torch.sqrt(var_B_proj)
 
         z_coeff_A = torch.randn(
             A.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
@@ -239,27 +249,23 @@ class DSMeZO_Controller:
 
     def _score_contrastive(
         self,
-        trajectories: tuple[list[int], list[int]],
-        advantages: tuple[float, float],
+        trajectories: list[list[int]],
+        advantages: list[float],
         prompt_len: int,
     ) -> tuple[float, float]:
-        """Advantage-weighted NLL under θ+ and θ-."""
-        winner_tokens, loser_tokens = trajectories
-        adv_w, adv_l = advantages
+        """Advantage-weighted NLL under θ+ and θ- for all N candidates."""
+        lp_pos = [lp[prompt_len:] for lp in self.backend.score(trajectories, self.backend.lora_pos)]
+        lp_neg = [lp[prompt_len:] for lp in self.backend.score(trajectories, self.backend.lora_neg)]
 
-        seqs = [winner_tokens, loser_tokens]
-        lp_pos = [lp[prompt_len:] for lp in self.backend.score(seqs, self.backend.lora_pos)]
-        lp_neg = [lp[prompt_len:] for lp in self.backend.score(seqs, self.backend.lora_neg)]
-
-        loss_pos = adv_w * _mean_nll(lp_pos[0]) + adv_l * _mean_nll(lp_pos[1])
-        loss_neg = adv_w * _mean_nll(lp_neg[0]) + adv_l * _mean_nll(lp_neg[1])
+        loss_pos = sum(adv * _mean_nll(lp) for adv, lp in zip(advantages, lp_pos))
+        loss_neg = sum(adv * _mean_nll(lp) for adv, lp in zip(advantages, lp_neg))
 
         return loss_pos, loss_neg
 
     def _explore(
         self, batch: list[str],
-    ) -> tuple[tuple[list[int], list[int]], tuple[float, float], int]:
-        """Generate candidates, compute RLOO advantages, return (trajectories, advantages, prompt_len)."""
+    ) -> tuple[list[list[int]], list[float], int]:
+        """Generate candidates, compute shrinkage RLOO advantages, return all trajectories."""
         self.backend.sync_adapters({}, {}, self.layers)
         request_outputs = self.backend.generate(
             batch, self.temperature, self.num_candidates
@@ -270,70 +276,109 @@ class DSMeZO_Controller:
             (out, self.score_fn(out.text))
             for out in request_outputs[0].outputs
         ]
-        scored.sort(key=lambda x: x[1], reverse=True)
 
-        best_output, best_reward = scored[0]
-        worst_output, worst_reward = scored[-1]
-
-        # RLOO advantages (leave-one-out baseline)
+        # Shrinkage RLOO (James-Stein optimal baseline)
         rewards = torch.tensor([r for _, r in scored])
         N = len(scored)
-        baselines = (rewards.sum() - rewards) / (N - 1)
-        advantages = rewards - baselines
-        adv_w = float(advantages[0])   # best (sorted descending)
-        adv_l = float(advantages[-1])  # worst
+        r_bar = float(rewards.mean())
+        baselines_rloo = (rewards.sum() - rewards) / (N - 1)
+        reward_var = float(rewards.var())
+        lam = reward_var / (reward_var + (r_bar - self.reward_ema) ** 2 + self.norm_floor)
+        baselines = (1.0 - lam) * baselines_rloo + lam * self.reward_ema
+        advantages = [float(r - b) for r, b in zip(rewards, baselines)]
 
-        winner_full = list(prompt_token_ids) + list(best_output.token_ids)
-        loser_full = list(prompt_token_ids) + list(worst_output.token_ids)
+        # Update reward EMA using current β
+        beta = self._momentum
+        self.reward_ema = beta * self.reward_ema + (1.0 - beta) * r_bar
+
+        # Build full token sequences for all candidates
+        trajectories = [
+            list(prompt_token_ids) + list(out.token_ids) for out, _ in scored
+        ]
         prompt_len = len(prompt_token_ids)
 
-        return (winner_full, loser_full), (adv_w, adv_l), prompt_len
+        return trajectories, advantages, prompt_len
 
-    def step(self, batch: list[str]) -> None:
-        self.step_count += 1
-
-        trajectories, advantages, prompt_len = self._explore(batch)
-
+    def _perturb_and_sync(
+        self, batch: list[str],
+    ) -> dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]]:
+        """Compute perturbations, apply dual perturbation, sync to backend."""
         batch_activations = self.backend.extract_activations(batch)
         self._update_activation_bases(batch_activations)
 
-        perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer in self.layers:
-            perturbations[layer.key] = self._get_perturbation(layer)
+        perturbations = {l.key: self._get_perturbation(l) for l in self.layers}
 
         pos_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
+            key_A, key_B = (layer.key, "A"), (layer.key, "B")
             fused_perturb_dual(layer.A, z_A, self.pos_buffers[key_A], self.neg_buffers[key_A])
             fused_perturb_dual(layer.B, z_B, self.pos_buffers[key_B], self.neg_buffers[key_B])
             pos_layers[layer.key] = (self.pos_buffers[key_A], self.pos_buffers[key_B])
             neg_layers[layer.key] = (self.neg_buffers[key_A], self.neg_buffers[key_B])
 
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
+        return perturbations
 
-        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
-
-        dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
-
+    def _update_weights(
+        self,
+        perturbations: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
+        dd: float,
+    ) -> None:
+        """Diagonal Kalman update + ZO-Muon spectral optimization."""
         max_window = int(math.sqrt(self.total_steps))
-        momentum = 1.0 - 1.0 / min(self.step_count, max_window)
+        self._momentum = 1.0 - 1.0 / min(self.step_count, max_window)
+        beta = self._momentum
+        q = self.eps ** 2 * (1.0 - beta * beta)
 
+        # Pass 1: Kalman prediction + global reductions (ŷ and S across all layers)
+        y_hat = 0.0
+        s_sum = 0.0
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
-            zo_muon_update(layer.A, self.momentum_buffers[key_A],
-                           z_A, self.scratch_buffers[key_A],
-                           dd, momentum, self.eta, self.norm_floor)
-            zo_muon_update(layer.B, self.momentum_buffers[key_B],
-                           z_B, self.scratch_buffers[key_B],
-                           dd, momentum, self.eta, self.norm_floor)
+            for z_mat, suffix in [(z_A, "A"), (z_B, "B")]:
+                key = (layer.key, suffix)
+                mu = self.momentum_buffers[key]
+                var = self.variance_buffers[key]
+                mu.mul_(beta)
+                var.mul_(beta * beta).add_(q)
+                y_hat += (z_mat * mu).sum().item()
+                s_sum += (z_mat * z_mat * var).sum().item()
+
+        S = s_sum + self.norm_floor
+        innovation = dd - y_hat
+        inv_S = 1.0 / S
+
+        # Pass 2: Kalman observation update + N-S orthogonalization
+        for layer in self.layers:
+            z_A, z_B = perturbations[layer.key]
+            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
+                key = (layer.key, suffix)
+                mu = self.momentum_buffers[key]
+                var = self.variance_buffers[key]
+                K = var * z_mat * inv_S
+                mu.add_(innovation * K)
+                var.mul_(1.0 - K * z_mat)
+                zo_muon_update(param, mu, self.scratch_buffers[key], self.eta, self.norm_floor)
 
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
+
+    def step(self, batch: list[str]) -> None:
+        self.step_count += 1
+        trajectories, advantages, prompt_len = self._explore(batch)
+
+        # Dynamic sampling: skip when advantages are below SPSA truncation floor
+        if max(abs(a) for a in advantages) < self.eps:
+            self.lr_scheduler.step()
+            self.eta = self._lr_opt.param_groups[0]["lr"]
+            return
+
+        perturbations = self._perturb_and_sync(batch)
+        loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
+        dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
+        self._update_weights(perturbations, dd)
 
     def train(self, prompts: list[str]) -> None:
         log_interval = self.total_steps // 100
@@ -373,6 +418,8 @@ class DSMeZO_Controller:
             tensors[f"master.layer{idx}.{mod}.B"] = layer.B
             tensors[f"momentum.layer{idx}.{mod}.A"] = self.momentum_buffers[(layer.key, "A")]
             tensors[f"momentum.layer{idx}.{mod}.B"] = self.momentum_buffers[(layer.key, "B")]
+            tensors[f"variance.layer{idx}.{mod}.A"] = self.variance_buffers[(layer.key, "A")]
+            tensors[f"variance.layer{idx}.{mod}.B"] = self.variance_buffers[(layer.key, "B")]
             tensors[f"act_basis.layer{idx}.{mod}"] = self.activation_bases[layer.key]
         tensors["rng_state"] = self.rng.get_state()
         save_file(tensors, str(step_dir / "optimizer_state.safetensors"))
@@ -380,6 +427,7 @@ class DSMeZO_Controller:
         training_state = {
             "step": step,
             "eta": self.eta,
+            "reward_ema": self.reward_ema,
             "lr_scheduler": self.lr_scheduler.state_dict(),
         }
         with open(step_dir / "training_state.json", "w") as f:

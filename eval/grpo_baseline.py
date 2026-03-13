@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import time
 from pathlib import Path
@@ -15,19 +14,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from vllm.lora.request import LoRARequest
 
-import evaluate
-
 from ds_mezo.backend import create_engine
-from eval.benchmarks import eval_mbpp, load_mbpp_train
-from eval.utils import extract_code
+from eval.benchmarks import eval_mbpp, load_mbpp_train, extract_code, _get_code_eval
 
 
 # ── Reward function (TRL interface) ─────────────────────────────────────────
-
-@functools.lru_cache(maxsize=1)
-def _get_code_eval():
-    return evaluate.load("code_eval")
-
 
 def mbpp_exec_reward(completions: list[str], test_list: list,
                      test_imports: list, **kwargs) -> list[float]:

@@ -1,5 +1,5 @@
-"""Benchmarks: perplexity, GSM8K exact match, MBPP pass@k, HumanEval pass@k,
-SST-2 accuracy, RTE accuracy, LiveCodeBench pass@k, APPS data loading."""
+"""Benchmarks: MBPP pass@k, HumanEval pass@k, SST-2 accuracy, RTE accuracy,
+LiveCodeBench pass@k, APPS data loading."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import functools
 import json
 import math
 import re
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from scipy import stats
@@ -16,133 +16,57 @@ import evaluate
 from datasets import load_dataset
 from vllm import SamplingParams
 
-from eval.utils import extract_code
-
-
 @functools.lru_cache(maxsize=1)
 def _get_code_eval():
     return evaluate.load("code_eval")
 
 
-@functools.lru_cache(maxsize=1)
-def _get_exact_match():
-    return evaluate.load("exact_match")
+def extract_code(text: str) -> str:
+    blocks = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n".join(blocks).strip()
+
+    blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n".join(blocks).strip()
+
+    return text.strip()
 
 
-def _bootstrap_ci(
-    samples: np.ndarray,
-    confidence_level: float = 0.95,
-    n_resamples: int = 10000,
-    seed: int = 42,
-) -> tuple[float, float]:
+def make_exec_reward() -> tuple[Callable[[str], float], Callable[[list[str], list[str]], None]]:
+    state: dict[str, list[str]] = {"tests": [], "imports": []}
+    code_eval = _get_code_eval()
+
+    def set_problem(tests: list[str], imports: list[str]) -> None:
+        state["tests"] = tests
+        state["imports"] = imports
+
+    def reward(text: str) -> float:
+        code = extract_code(text)
+        import_block = "\n".join(state["imports"])
+        references = [f"{import_block}\n{test}" for test in state["tests"]]
+        predictions = [[code]] * len(references)
+        _, results_dict = code_eval.compute(
+            references=references, predictions=predictions,
+            k=[1], num_workers=1, timeout=3.0,
+        )
+        passed = sum(
+            1 for task_results in results_dict.values()
+            for _, r in task_results if r["passed"]
+        )
+        return passed / len(state["tests"])
+
+    return reward, set_problem
+
+
+def _bootstrap_ci(samples: np.ndarray) -> tuple[float, float]:
     result = stats.bootstrap(
-        (samples,),
-        np.mean,
-        confidence_level=confidence_level,
-        n_resamples=n_resamples,
-        random_state=np.random.default_rng(seed),
-        method="percentile",
+        (samples,), np.mean,
+        confidence_level=0.95, n_resamples=10000,
+        random_state=np.random.default_rng(42), method="percentile",
     )
-    return (
-        float(result.confidence_interval.low),
-        float(result.confidence_interval.high),
-    )
-
-
-def eval_perplexity(
-    engine: Any,
-    token_sequences: list[list[int]],
-    prompt_lens: list[int],
-    lora_request: Any,
-) -> dict[str, Any]:
-    score_params = SamplingParams(max_tokens=1, prompt_logprobs=1, temperature=0.0)
-    prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
-    outputs = engine.generate(
-        prompts, sampling_params=score_params, lora_request=lora_request,
-    )
-
-    per_sample_nlls: list[float] = []
-    total_nll, total_tokens = 0.0, 0
-    for out, seq, plen in zip(outputs, token_sequences, prompt_lens):
-        sample_nll = 0.0
-        sample_tokens = 0
-        for i in range(plen, len(out.prompt_logprobs)):
-            sample_nll += -out.prompt_logprobs[i][seq[i]].logprob
-            sample_tokens += 1
-        total_nll += sample_nll
-        total_tokens += sample_tokens
-        per_sample_nlls.append(sample_nll / sample_tokens)
-
-    avg_nll = total_nll / total_tokens
-    samples = np.array(per_sample_nlls)
-    nll_ci = _bootstrap_ci(samples)
-
-    return {
-        "perplexity": math.exp(avg_nll),
-        "perplexity_ci95": (math.exp(nll_ci[0]), math.exp(nll_ci[1])),
-        "avg_nll": avg_nll,
-        "avg_nll_ci95": nll_ci,
-        "total_tokens": total_tokens,
-        "num_samples": len(per_sample_nlls),
-    }
-
-
-@functools.lru_cache(maxsize=1)
-def _get_gsm8k_fewshot(n_shot: int = 8) -> tuple[dict, ...]:
-    train = load_dataset("openai/gsm8k", "main", split="train")
-    return tuple(dict(row) for row in train.select(range(n_shot)))
-
-
-def _build_gsm8k_prompt(question: str, fewshot: tuple[dict, ...]) -> str:
-    parts = []
-    for ex in fewshot:
-        parts.append(f"Q: {ex['question']}\nA: {ex['answer']}")
-    parts.append(f"Q: {question}\nA:")
-    return "\n\n".join(parts)
-
-
-def _extract_gsm8k_answer(text: str) -> str:
-    m = re.search(r"[Tt]he answer is\s*\$?\s*(-?[\d,]+)", text)
-    if m:
-        return m.group(1).replace(",", "")
-    m = re.search(r"####\s*(-?[\d,]+)", text)
-    if m:
-        return m.group(1).replace(",", "")
-    nums = re.findall(r"-?\d+", text)
-    return nums[-1] if nums else ""
-
-
-def eval_gsm8k(
-    engine: Any,
-    lora_request: Any,
-) -> dict[str, Any]:
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
-    exact_match = _get_exact_match()
-    fewshot = _get_gsm8k_fewshot()
-    prompts = [_build_gsm8k_prompt(row["question"], fewshot) for row in dataset]
-
-    outputs = engine.generate(
-        prompts,
-        SamplingParams(max_tokens=512, temperature=0.0, stop=["Q:", "\n\n\n"]),
-        lora_request=lora_request,
-    )
-
-    predictions, references = [], []
-    for out, row in zip(outputs, dataset):
-        predictions.append(_extract_gsm8k_answer(out.outputs[0].text))
-        ref_match = re.search(r"####\s*(-?[\d,]+)", row["answer"])
-        references.append(ref_match.group(1).replace(",", ""))
-
-    result = exact_match.compute(predictions=predictions, references=references)
-
-    per_sample = np.array([
-        1.0 if p == r else 0.0
-        for p, r in zip(predictions, references)
-    ])
-    result["exact_match_ci95"] = _bootstrap_ci(per_sample)
-    result["num_samples"] = len(dataset)
-    result["num_parsed"] = sum(1 for p in predictions if p != "")
-    return result
+    return (float(result.confidence_interval.low),
+            float(result.confidence_interval.high))
 
 
 def load_mbpp_train() -> list[dict[str, Any]]:
@@ -161,32 +85,33 @@ def build_mbpp_prompt(row: dict) -> str:
     return f'"""\n{row["prompt"]}\n{row["test_list"][0]}\n"""\n'
 
 
-def eval_mbpp(
+_CODE_STOP = ["\nclass", "\nassert", '\n"""', "\nprint", "\nif"]
+
+
+def _eval_code_gen(
     engine: Any,
-    lora_request: Any,
+    prompts: list[str],
+    references: list[str],
     n_samples: int,
     temperature: float,
+    lora_request: Any = None,
+    stop: list[str] | None = None,
+    prefix_fn: Callable[[str, str], str] | None = None,
 ) -> dict[str, Any]:
-    dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+    """Shared code-gen evaluation: generate → extract → code_eval → pass@k + CI."""
     code_eval = _get_code_eval()
-    prompts = [build_mbpp_prompt(row) for row in dataset]
-
-    stop = ["\nclass", "\nassert", '\n"""', "\nprint", "\nif"]
     gen_params = SamplingParams(
         max_tokens=512, temperature=temperature, n=n_samples,
-        stop=stop, top_p=0.95,
+        stop=stop or _CODE_STOP, top_p=0.95,
     )
-
     outputs = engine.generate(prompts, gen_params, lora_request=lora_request)
 
     predictions: list[list[str]] = []
-    references: list[str] = []
-    for out, row in zip(outputs, dataset):
+    for out, prompt in zip(outputs, prompts):
         completions = [extract_code(o.text) for o in out.outputs]
+        if prefix_fn is not None:
+            completions = [prefix_fn(prompt, c) for c in completions]
         predictions.append(completions)
-        imports = "\n".join(row["test_imports"])
-        tests = "\n".join(row["test_list"])
-        references.append(f"{imports}\n{tests}")
 
     pass_at_k_results, results_dict = code_eval.compute(
         references=references, predictions=predictions,
@@ -203,7 +128,7 @@ def eval_mbpp(
     result: dict[str, Any] = {
         "pass@1": pass_at_k_results["pass@1"],
         "pass@1_ci95": _bootstrap_ci(per_task_pass1),
-        "num_tasks": len(dataset),
+        "num_tasks": len(prompts),
     }
 
     if n_samples >= 10:
@@ -217,61 +142,28 @@ def eval_mbpp(
     return result
 
 
-# ── HumanEval ─────────────────────────────────────────────────────────────────
+def eval_mbpp(
+    engine: Any, lora_request: Any, n_samples: int, temperature: float,
+) -> dict[str, Any]:
+    dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+    prompts = [build_mbpp_prompt(row) for row in dataset]
+    references = [
+        "\n".join(row["test_imports"]) + "\n" + "\n".join(row["test_list"])
+        for row in dataset
+    ]
+    return _eval_code_gen(engine, prompts, references, n_samples, temperature,
+                          lora_request=lora_request)
 
 
 def eval_humaneval(
-    engine: Any,
-    lora_request: Any,
-    n_samples: int,
-    temperature: float,
+    engine: Any, lora_request: Any, n_samples: int, temperature: float,
 ) -> dict[str, Any]:
     dataset = load_dataset("openai_humaneval", split="test")
-    code_eval = _get_code_eval()
-
-    stop = ["\nclass", "\nassert", '\n"""', "\nprint", "\nif"]
-    gen_params = SamplingParams(
-        max_tokens=512, temperature=temperature, n=n_samples,
-        stop=stop, top_p=0.95,
-    )
-
     prompts = [row["prompt"] for row in dataset]
-    outputs = engine.generate(prompts, gen_params, lora_request=lora_request)
-
-    predictions: list[list[str]] = []
-    references: list[str] = []
-    for out, row in zip(outputs, dataset):
-        completions = [row["prompt"] + extract_code(o.text) for o in out.outputs]
-        predictions.append(completions)
-        references.append(row["test"] + f"\ncheck({row['entry_point']})")
-
-    pass_at_k_results, results_dict = code_eval.compute(
-        references=references, predictions=predictions,
-        k=[1, 10] if n_samples >= 10 else [1],
-    )
-
-    per_task_c = [
-        sum(1 for _, r in task_results if r["passed"])
-        for task_results in results_dict.values()
-    ]
-    per_task_n = [len(task_results) for task_results in results_dict.values()]
-    per_task_pass1 = np.array([c / n for c, n in zip(per_task_c, per_task_n)])
-
-    result: dict[str, Any] = {
-        "pass@1": pass_at_k_results["pass@1"],
-        "pass@1_ci95": _bootstrap_ci(per_task_pass1),
-        "num_tasks": len(dataset),
-    }
-
-    if n_samples >= 10:
-        per_task_pass10 = np.array([
-            1.0 - math.comb(n - c, 10) / math.comb(n, 10)
-            for c, n in zip(per_task_c, per_task_n)
-        ])
-        result["pass@10"] = pass_at_k_results["pass@10"]
-        result["pass@10_ci95"] = _bootstrap_ci(per_task_pass10)
-
-    return result
+    references = [row["test"] + f"\ncheck({row['entry_point']})" for row in dataset]
+    return _eval_code_gen(engine, prompts, references, n_samples, temperature,
+                          lora_request=lora_request,
+                          prefix_fn=lambda prompt, code: prompt + code)
 
 
 # ── SuperGLUE: SST-2 + RTE ───────────────────────────────────────────────────
@@ -402,65 +294,72 @@ def load_apps_train(
 
 
 def eval_livecodebench(
-    engine: Any,
-    lora_request: Any,
-    n_samples: int,
-    temperature: float,
+    engine: Any, lora_request: Any, n_samples: int, temperature: float,
 ) -> dict[str, Any]:
     dataset = load_dataset("livecodebench/code_generation_lite", split="test")
-    code_eval = _get_code_eval()
-
-    stop = ["\nclass", "\nassert", '\n"""', "\nprint", "\nif"]
-    gen_params = SamplingParams(
-        max_tokens=512, temperature=temperature, n=n_samples,
-        stop=stop, top_p=0.95,
-    )
-
     prompts = []
+    references = []
     for row in dataset:
         prompt = row["question_content"]
         if row.get("starter_code"):
             prompt += f"\n{row['starter_code']}"
         prompts.append(prompt)
-
-    outputs = engine.generate(prompts, gen_params, lora_request=lora_request)
-
-    predictions: list[list[str]] = []
-    references: list[str] = []
-    for out, row in zip(outputs, dataset):
-        completions = [extract_code(o.text) for o in out.outputs]
-        predictions.append(completions)
-        test_cases = json.loads(row["test"]) if isinstance(row["test"], str) else row["test"]
-        test_code = "\n".join(
+        test_cases = json.loads(row["test"])
+        references.append("\n".join(
             f"assert solution({repr(tc['input'])}) == {repr(tc['output'])}"
             for tc in test_cases
-        )
-        references.append(test_code)
+        ))
+    return _eval_code_gen(engine, prompts, references, n_samples, temperature,
+                          lora_request=lora_request)
 
-    pass_at_k_results, results_dict = code_eval.compute(
-        references=references, predictions=predictions,
-        k=[1, 10] if n_samples >= 10 else [1],
-    )
 
-    per_task_c = [
-        sum(1 for _, r in task_results if r["passed"])
-        for task_results in results_dict.values()
-    ]
-    per_task_n = [len(task_results) for task_results in results_dict.values()]
-    per_task_pass1 = np.array([c / n for c, n in zip(per_task_c, per_task_n)])
+# ── Setup helpers ────────────────────────────────────────────────────────────
 
-    result: dict[str, Any] = {
-        "pass@1": pass_at_k_results["pass@1"],
-        "pass@1_ci95": _bootstrap_ci(per_task_pass1),
-        "num_tasks": len(dataset),
+from pathlib import Path
+
+from peft import PeftConfig
+
+from ds_mezo.model_config import discover_layers
+from ds_mezo.backend import VLLMBackend, create_engine
+from ds_mezo.controller import DSMeZO_Controller
+
+
+def load_adapter_config(adapter_path: Path | str) -> tuple[int, list[str]]:
+    """Read rank and target_modules from PeftConfig."""
+    peft_config = PeftConfig.from_pretrained(str(adapter_path))
+    return peft_config.r, list(peft_config.target_modules)
+
+
+def setup_controller(
+    model_path: Path | str,
+    adapter_path: Path | str,
+    output_dir: Path | str,
+    total_steps: int,
+    score_fn: Callable | None = None,
+    calibration_prompt: str | None = None,
+    engine: Any = None,
+    layer_specs: list | None = None,
+    rank: int | None = None,
+) -> tuple[Any, VLLMBackend, DSMeZO_Controller, int, list]:
+    """Build vLLM engine (or reuse), create backend + controller, calibrate.
+    Returns (engine, backend, controller, rank, layer_specs)."""
+    if rank is None:
+        rank, target_modules = load_adapter_config(adapter_path)
+    else:
+        _, target_modules = load_adapter_config(adapter_path)
+    if engine is None:
+        engine = create_engine(model_path, rank)
+    if layer_specs is None:
+        layer_specs = discover_layers(model_path, target_modules)
+    backend = VLLMBackend(engine, layer_specs, rank)
+    config: dict[str, Any] = {
+        "output_dir": str(output_dir),
+        "adapter_path": str(adapter_path),
+        "total_steps": total_steps,
     }
-
-    if n_samples >= 10:
-        per_task_pass10 = np.array([
-            1.0 - math.comb(n - c, 10) / math.comb(n, 10)
-            for c, n in zip(per_task_c, per_task_n)
-        ])
-        result["pass@10"] = pass_at_k_results["pass@10"]
-        result["pass@10_ci95"] = _bootstrap_ci(per_task_pass10)
-
-    return result
+    if score_fn is not None:
+        config["score_fn"] = score_fn
+    controller = DSMeZO_Controller(backend, layer_specs, config)
+    if calibration_prompt is not None:
+        controller._calibrate_activation_bases_full([calibration_prompt])
+    return engine, backend, controller, rank, layer_specs

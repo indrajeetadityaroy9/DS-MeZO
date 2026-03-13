@@ -1,10 +1,10 @@
 """Triton kernels for DS-MeZO — Hopper-native (sm_90), H100-validated.
 
-Kernel 1: zo_muon_update — fuses SPSA gradient, momentum accumulation,
-    Frobenius normalization, Newton-Schulz orthogonalization, and parameter
-    update into a single kernel launch per adapter matrix. Dispatches tall
-    (M>=N, tiles rows) vs wide (M<N, tiles columns). Mechanism-critical:
-    this IS the ZO-Muon optimizer.
+Kernel 1: zo_muon_update — fuses Frobenius normalization, Newton-Schulz
+    orthogonalization, and parameter update into a single kernel launch per
+    adapter matrix. Dispatches tall (M>=N, tiles rows) vs wide (M<N, tiles
+    columns). Kalman gradient estimation happens in Python before the kernel
+    call. Mechanism-critical: this IS the ZO-Muon spectral optimizer.
 
 Kernel 2: fused_power_iter — warm-started power iteration for activation
     subspace tracking. Fuses num_iters×(H.T@H@V + QR) → 1 kernel launch
@@ -73,7 +73,7 @@ Invariant constants (mathematically fixed, not tunable):
 Tensor conventions:
   - All inputs: FP32, 2D, contiguous, CUDA.
   - Adapter rank >= 16 (tl.dot contraction minimum on Hopper).
-  - zo_muon_update: param, buf, z, scratch — identical shape.
+  - zo_muon_update: param, buf, scratch — identical shape.
   - fused_power_iter: H (T, D), V (D, R). D and R padded to next power of 2
     internally. Register pressure: V tile is next_power_of_2(D) × next_power_of_2(R)
     FP32 values. For D=4096, R=8 → 128KB, near H100 256KB register file limit.
@@ -135,27 +135,28 @@ _NS_C3 = tuple(c3 for _, c3 in _NS_COEFFS)
 # At ~135μs/step total across 64 calls, <0.2% of vLLM-dominated step time.
 
 
-# ── Kernel 1: Fused ZO-Muon update ────────────────────────────────────────
-# Fuses: SPSA gradient → momentum → Frobenius normalize →
-# N-S orthogonalization → parameter update.
-# Single kernel launch per adapter matrix (vs ~21 PyTorch ops unfused).
+# ── Kernel 1: ZO-Muon spectral update ─────────────────────────────────────
+# Fuses: Frobenius normalize → N-S orthogonalization → parameter update.
+# Kalman gradient estimation (prediction + observation) runs in Python.
+# Single kernel launch per adapter matrix.
 
 @triton.jit
 def _zo_muon_tall_kernel(
-    param_ptr, buf_ptr, z_ptr, scratch_ptr,
+    param_ptr, buf_ptr, scratch_ptr,
     M, N: tl.constexpr,
     stride_m, stride_n,
-    dd, momentum, eta,
+    eta,
     BLOCK_M: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
     """ZO-Muon for tall matrices (M >= N). Tiles along M rows.
-    N-S degree-3 minimax: X = X @ (c1·I + c3·G), G = X.T@X. Inner product is (N, N)."""
+    N-S degree-3 minimax: X = X @ (c1·I + c3·G), G = X.T@X. Inner product is (N, N).
+    buf already contains the Kalman posterior mean (updated in Python)."""
 
     offs_n = tl.arange(0, N)
     num_chunks = tl.cdiv(M, BLOCK_M)
 
-    # Pass 1: SPSA gradient + momentum + Frobenius norm
+    # Pass 1: Frobenius norm of buf
     norm_sq = tl.zeros([1], dtype=tl.float32)
 
     for chunk in range(num_chunks):
@@ -164,12 +165,7 @@ def _zo_muon_tall_kernel(
         mask = offs_m[:, None] < M
         ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
 
-        z_tile = tl.load(z_ptr + ptrs, mask=mask, other=0.0)
-        grad_tile = dd * z_tile
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
-
-        buf_tile = momentum * buf_tile + (1.0 - momentum) * grad_tile
-        tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
         norm_sq += tl.sum(buf_tile * buf_tile)
 
     inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, NORM_FLOOR))
@@ -222,20 +218,21 @@ def _zo_muon_tall_kernel(
 
 @triton.jit
 def _zo_muon_wide_kernel(
-    param_ptr, buf_ptr, z_ptr, scratch_ptr,
+    param_ptr, buf_ptr, scratch_ptr,
     M: tl.constexpr, N,
     stride_m, stride_n,
-    dd, momentum, eta,
+    eta,
     BLOCK_N: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
     """ZO-Muon for wide matrices (M < N). Tiles along N columns.
-    N-S degree-3 minimax: X = (c1·I + c3·G) @ X, G = X@X.T. Inner product is (M, M)."""
+    N-S degree-3 minimax: X = (c1·I + c3·G) @ X, G = X@X.T. Inner product is (M, M).
+    buf already contains the Kalman posterior mean (updated in Python)."""
 
     offs_m = tl.arange(0, M)
     num_chunks = tl.cdiv(N, BLOCK_N)
 
-    # Pass 1: SPSA gradient + momentum + Frobenius norm
+    # Pass 1: Frobenius norm of buf
     norm_sq = tl.zeros([1], dtype=tl.float32)
 
     for chunk in range(num_chunks):
@@ -244,12 +241,7 @@ def _zo_muon_wide_kernel(
         mask = offs_n[None, :] < N
         ptrs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
 
-        z_tile = tl.load(z_ptr + ptrs, mask=mask, other=0.0)
-        grad_tile = dd * z_tile
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
-
-        buf_tile = momentum * buf_tile + (1.0 - momentum) * grad_tile
-        tl.store(buf_ptr + ptrs, buf_tile, mask=mask)
         norm_sq += tl.sum(buf_tile * buf_tile)
 
     inv_norm = 1.0 / tl.sqrt(tl.maximum(norm_sq, NORM_FLOOR))
@@ -302,15 +294,13 @@ def _zo_muon_wide_kernel(
 def zo_muon_update(
     param: torch.Tensor,
     buf: torch.Tensor,
-    z: torch.Tensor,
     scratch: torch.Tensor,
-    dd: float,
-    momentum: float,
     eta: float,
     norm_floor: float,
 ) -> None:
-    """Fused ZO-Muon update: grad → momentum → minimax Newton-Schulz → param update.
+    """Frobenius normalize → minimax Newton-Schulz → param update.
 
+    buf contains the Kalman posterior mean (updated in Python before this call).
     Dispatches tall (M >= N) vs wide (M < N) kernel. Both forms use
     min(M,N) × min(M,N) inner products (= rank × rank, minimum 16×16).
     N-S coefficients from minimax-optimal degree-3 composition (Polar Express).
@@ -318,19 +308,19 @@ def zo_muon_update(
     M, N = param.shape
     if M >= N:
         _zo_muon_tall_kernel[(1,)](
-            param, buf, z, scratch,
+            param, buf, scratch,
             M, N=N,
             stride_m=param.stride(0), stride_n=param.stride(1),
-            dd=dd, momentum=momentum, eta=eta,
+            eta=eta,
             BLOCK_M=128,
             NORM_FLOOR=norm_floor,
         )
     else:
         _zo_muon_wide_kernel[(1,)](
-            param, buf, z, scratch,
+            param, buf, scratch,
             M=M, N=N,
             stride_m=param.stride(0), stride_n=param.stride(1),
-            dd=dd, momentum=momentum, eta=eta,
+            eta=eta,
             BLOCK_N=128,
             NORM_FLOOR=norm_floor,
         )
