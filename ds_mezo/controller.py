@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,15 +18,12 @@ from optht import optht
 from safetensors.torch import load_file, save_file
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from ds_mezo.backend import _save_peft_adapter, _write_adapter_config
+from ds_mezo.adapter_io import save_peft_adapter, write_adapter_config
 from ds_mezo.kernels import zo_muon_update, fused_power_iter, fused_agzo_perturbation, fused_perturb_dual
-from ds_mezo.model_config import LayerSpec
+from ds_mezo.model_config import LayerSpec, svd_power_iters
 
 _CONFIG_DEFAULTS: dict[str, Any] = {
-    "output_dir": "output",
     "staging_dir": "/dev/shm/ds_mezo",
-    "adapter_path": "",
-    "total_steps": 1000,
     "seed": 42,
     "score_fn": lambda text: 0.0,
     "resume_from": None,
@@ -46,6 +43,16 @@ class LayerState:
     layer_idx: int
     module_name: str
     peft_prefix: str
+    momentum_A: torch.Tensor | None = field(default=None, repr=False)
+    momentum_B: torch.Tensor | None = field(default=None, repr=False)
+    variance_A: torch.Tensor | None = field(default=None, repr=False)
+    variance_B: torch.Tensor | None = field(default=None, repr=False)
+    scratch_A: torch.Tensor | None = field(default=None, repr=False)
+    scratch_B: torch.Tensor | None = field(default=None, repr=False)
+    pos_A: torch.Tensor | None = field(default=None, repr=False)
+    pos_B: torch.Tensor | None = field(default=None, repr=False)
+    neg_A: torch.Tensor | None = field(default=None, repr=False)
+    neg_B: torch.Tensor | None = field(default=None, repr=False)
 
     @property
     def key(self) -> tuple[int, str]:
@@ -53,6 +60,9 @@ class LayerState:
 
 
 class DSMeZO_Controller:
+    NUM_CANDIDATES = 4
+    TEMPERATURE = 1.0
+
     def __init__(
         self,
         backend: Any,
@@ -91,11 +101,7 @@ class DSMeZO_Controller:
                 peft_prefix=ls.peft_prefix,
             ))
 
-        rank = self.layers[0].B.shape[0]
         self.backend.sync_adapters({}, {}, self.layers)
-
-        self.num_candidates = 4
-        self.temperature = 1.0
         self.reward_ema = 0.0
         self._momentum = 0.0
 
@@ -114,39 +120,27 @@ class DSMeZO_Controller:
             self._lr_opt, T_max=self.total_steps, eta_min=0.0,
         )
 
-        self.momentum_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
-        self.variance_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
-        self.scratch_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
-        self.pos_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
-        self.neg_buffers: dict[tuple[tuple[int, str], str], torch.Tensor] = {}
         for layer in self.layers:
-            key_A = (layer.key, "A")
-            key_B = (layer.key, "B")
-            self.momentum_buffers[key_A] = torch.zeros_like(layer.A)
-            self.momentum_buffers[key_B] = torch.zeros_like(layer.B)
-            self.variance_buffers[key_A] = torch.full_like(layer.A, self.eps ** 2)
-            self.variance_buffers[key_B] = torch.full_like(layer.B, self.eps ** 2)
-            self.scratch_buffers[key_A] = torch.zeros_like(layer.A)
-            self.scratch_buffers[key_B] = torch.zeros_like(layer.B)
-            self.pos_buffers[key_A] = torch.empty_like(layer.A)
-            self.pos_buffers[key_B] = torch.empty_like(layer.B)
-            self.neg_buffers[key_A] = torch.empty_like(layer.A)
-            self.neg_buffers[key_B] = torch.empty_like(layer.B)
+            layer.momentum_A = torch.zeros_like(layer.A)
+            layer.momentum_B = torch.zeros_like(layer.B)
+            layer.variance_A = torch.full_like(layer.A, self.eps ** 2)
+            layer.variance_B = torch.full_like(layer.B, self.eps ** 2)
+            layer.scratch_A = torch.zeros_like(layer.A)
+            layer.scratch_B = torch.zeros_like(layer.B)
+            layer.pos_A = torch.empty_like(layer.A)
+            layer.pos_B = torch.empty_like(layer.B)
+            layer.neg_A = torch.empty_like(layer.A)
+            layer.neg_B = torch.empty_like(layer.B)
 
         self._bf16_ckpt: dict[str, torch.Tensor] = {}
 
         self.r_calib = 0
         self.activation_bases: dict[tuple[int, str], torch.Tensor] = {}
 
-        eps_dtype = torch.finfo(torch.float32).eps
-
-        # Power iteration steps: ceil(log(log(1/eps)/log(2))/log(3))
-        self.power_iter_steps = math.ceil(
-            math.log(math.log(1.0 / eps_dtype) / math.log(2.0)) / math.log(3.0)
-        )
+        self.power_iter_steps = svd_power_iters()
         self.norm_floor = torch.finfo(torch.float32).tiny
 
-        if cfg["resume_from"] is not None:
+        if cfg["resume_from"]:
             self._load_checkpoint(Path(cfg["resume_from"]))
 
     # -- Checkpoint Resume --------------------------------------------------
@@ -159,10 +153,10 @@ class DSMeZO_Controller:
             idx, mod = layer.layer_idx, layer.module_name
             layer.A = tensors[f"master.layer{idx}.{mod}.A"]
             layer.B = tensors[f"master.layer{idx}.{mod}.B"]
-            self.momentum_buffers[(layer.key, "A")] = tensors[f"momentum.layer{idx}.{mod}.A"]
-            self.momentum_buffers[(layer.key, "B")] = tensors[f"momentum.layer{idx}.{mod}.B"]
-            self.variance_buffers[(layer.key, "A")] = tensors[f"variance.layer{idx}.{mod}.A"]
-            self.variance_buffers[(layer.key, "B")] = tensors[f"variance.layer{idx}.{mod}.B"]
+            layer.momentum_A = tensors[f"momentum.layer{idx}.{mod}.A"]
+            layer.momentum_B = tensors[f"momentum.layer{idx}.{mod}.B"]
+            layer.variance_A = tensors[f"variance.layer{idx}.{mod}.A"]
+            layer.variance_B = tensors[f"variance.layer{idx}.{mod}.B"]
             self.activation_bases[layer.key] = tensors[f"act_basis.layer{idx}.{mod}"]
 
         self.rng.set_state(tensors["rng_state"])
@@ -180,7 +174,6 @@ class DSMeZO_Controller:
     def _calibrate_activation_bases_full(self, input_data: list[str]) -> None:
         """Full SVD calibration — determines r_calib via Gavish-Donoho threshold."""
         activations = self.backend.extract_activations(input_data)
-        rank = self.layers[0].B.shape[0]
 
         gpu_acts: dict[int, torch.Tensor] = {}
         for layer in self.layers:
@@ -235,8 +228,7 @@ class DSMeZO_Controller:
         V_l = self.activation_bases[layer.key]
 
         # Variance-weighted B perturbation: sample proportional to posterior uncertainty
-        var_B = self.variance_buffers[(layer.key, "B")]
-        var_B_proj = var_B @ (V_l ** 2)  # (r, r_calib), always non-negative
+        var_B_proj = layer.variance_B @ (V_l ** 2)  # (r, r_calib), always non-negative
         z_coeff_B = torch.randn(
             B.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         ) * torch.sqrt(var_B_proj)
@@ -268,7 +260,7 @@ class DSMeZO_Controller:
         """Generate candidates, compute shrinkage RLOO advantages, return all trajectories."""
         self.backend.sync_adapters({}, {}, self.layers)
         request_outputs = self.backend.generate(
-            batch, self.temperature, self.num_candidates
+            batch, self.TEMPERATURE, self.NUM_CANDIDATES
         )
         prompt_token_ids = request_outputs[0].prompt_token_ids
 
@@ -293,7 +285,7 @@ class DSMeZO_Controller:
 
         # Build full token sequences for all candidates
         trajectories = [
-            list(prompt_token_ids) + list(out.token_ids) for out, _ in scored
+            prompt_token_ids + out.token_ids for out, _ in scored
         ]
         prompt_len = len(prompt_token_ids)
 
@@ -312,11 +304,10 @@ class DSMeZO_Controller:
         neg_layers: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            key_A, key_B = (layer.key, "A"), (layer.key, "B")
-            fused_perturb_dual(layer.A, z_A, self.pos_buffers[key_A], self.neg_buffers[key_A])
-            fused_perturb_dual(layer.B, z_B, self.pos_buffers[key_B], self.neg_buffers[key_B])
-            pos_layers[layer.key] = (self.pos_buffers[key_A], self.pos_buffers[key_B])
-            neg_layers[layer.key] = (self.neg_buffers[key_A], self.neg_buffers[key_B])
+            fused_perturb_dual(layer.A, z_A, layer.pos_A, layer.neg_A)
+            fused_perturb_dual(layer.B, z_B, layer.pos_B, layer.neg_B)
+            pos_layers[layer.key] = (layer.pos_A, layer.pos_B)
+            neg_layers[layer.key] = (layer.neg_A, layer.neg_B)
 
         self.backend.sync_adapters(pos_layers, neg_layers, self.layers)
         return perturbations
@@ -337,10 +328,8 @@ class DSMeZO_Controller:
         s_sum = 0.0
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            for z_mat, suffix in [(z_A, "A"), (z_B, "B")]:
-                key = (layer.key, suffix)
-                mu = self.momentum_buffers[key]
-                var = self.variance_buffers[key]
+            for z_mat, mu, var in [(z_A, layer.momentum_A, layer.variance_A),
+                                    (z_B, layer.momentum_B, layer.variance_B)]:
                 mu.mul_(beta)
                 var.mul_(beta * beta).add_(q)
                 y_hat += (z_mat * mu).sum().item()
@@ -353,15 +342,18 @@ class DSMeZO_Controller:
         # Pass 2: Kalman observation update + N-S orthogonalization
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
-                key = (layer.key, suffix)
-                mu = self.momentum_buffers[key]
-                var = self.variance_buffers[key]
+            for z_mat, param, mu, var, scratch in [
+                (z_A, layer.A, layer.momentum_A, layer.variance_A, layer.scratch_A),
+                (z_B, layer.B, layer.momentum_B, layer.variance_B, layer.scratch_B),
+            ]:
                 K = var * z_mat * inv_S
                 mu.add_(innovation * K)
                 var.mul_(1.0 - K * z_mat)
-                zo_muon_update(param, mu, self.scratch_buffers[key], self.eta, self.norm_floor)
+                zo_muon_update(param, mu, scratch, self.eta, self.norm_floor)
 
+        self._step_lr()
+
+    def _step_lr(self) -> None:
         self.lr_scheduler.step()
         self.eta = self._lr_opt.param_groups[0]["lr"]
 
@@ -371,8 +363,7 @@ class DSMeZO_Controller:
 
         # Dynamic sampling: skip when advantages are below SPSA truncation floor
         if max(abs(a) for a in advantages) < self.eps:
-            self.lr_scheduler.step()
-            self.eta = self._lr_opt.param_groups[0]["lr"]
+            self._step_lr()
             return
 
         perturbations = self._perturb_and_sync(batch)
@@ -408,18 +399,18 @@ class DSMeZO_Controller:
 
         A_list = [l.A for l in self.layers]
         B_list = [l.B for l in self.layers]
-        _save_peft_adapter(A_list, B_list, step_dir, self.layers, self._bf16_ckpt)
-        _write_adapter_config(step_dir, rank, target_modules)
+        save_peft_adapter(A_list, B_list, step_dir, self.layers, self._bf16_ckpt)
+        write_adapter_config(step_dir, rank, target_modules)
 
         tensors: dict[str, torch.Tensor] = {}
         for layer in self.layers:
             idx, mod = layer.layer_idx, layer.module_name
             tensors[f"master.layer{idx}.{mod}.A"] = layer.A
             tensors[f"master.layer{idx}.{mod}.B"] = layer.B
-            tensors[f"momentum.layer{idx}.{mod}.A"] = self.momentum_buffers[(layer.key, "A")]
-            tensors[f"momentum.layer{idx}.{mod}.B"] = self.momentum_buffers[(layer.key, "B")]
-            tensors[f"variance.layer{idx}.{mod}.A"] = self.variance_buffers[(layer.key, "A")]
-            tensors[f"variance.layer{idx}.{mod}.B"] = self.variance_buffers[(layer.key, "B")]
+            tensors[f"momentum.layer{idx}.{mod}.A"] = layer.momentum_A
+            tensors[f"momentum.layer{idx}.{mod}.B"] = layer.momentum_B
+            tensors[f"variance.layer{idx}.{mod}.A"] = layer.variance_A
+            tensors[f"variance.layer{idx}.{mod}.B"] = layer.variance_B
             tensors[f"act_basis.layer{idx}.{mod}"] = self.activation_bases[layer.key]
         tensors["rng_state"] = self.rng.get_state()
         save_file(tensors, str(step_dir / "optimizer_state.safetensors"))
@@ -435,8 +426,8 @@ class DSMeZO_Controller:
 
         adapter_dir = self.output_dir / "adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        _save_peft_adapter(A_list, B_list, adapter_dir, self.layers, self._bf16_ckpt)
-        _write_adapter_config(adapter_dir, rank, target_modules)
+        save_peft_adapter(A_list, B_list, adapter_dir, self.layers, self._bf16_ckpt)
+        write_adapter_config(adapter_dir, rank, target_modules)
 
         print(f"Checkpoint saved: {step_dir}")
 

@@ -9,36 +9,26 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset
-from peft import PeftConfig, PeftModel
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from vllm.lora.request import LoRARequest
 
 from ds_mezo.backend import create_engine
-from eval.benchmarks import eval_mbpp, load_mbpp_train, extract_code, _get_code_eval
+from ds_mezo.model_config import load_adapter_config
+from eval.benchmarks import eval_mbpp
+from eval.data import load_mbpp_train
+from eval.rewards import extract_code, _score_code_solution
 
 
 # ── Reward function (TRL interface) ─────────────────────────────────────────
 
 def mbpp_exec_reward(completions: list[str], test_list: list,
                      test_imports: list, **kwargs) -> list[float]:
-    code_eval = _get_code_eval()
-    scores = []
-    for completion, tests, imports in zip(completions, test_list, test_imports):
-        code = extract_code(completion)
-        import_block = "\n".join(imports)
-        references = [f"{import_block}\n{test}" for test in tests]
-        predictions = [[code]] * len(references)
-        _, results_dict = code_eval.compute(
-            references=references, predictions=predictions,
-            k=[1], num_workers=1, timeout=3.0,
-        )
-        passed = sum(
-            1 for task_results in results_dict.values()
-            for _, r in task_results if r["passed"]
-        )
-        scores.append(passed / len(tests))
-    return scores
+    return [
+        _score_code_solution(extract_code(c), tests, imports)
+        for c, tests, imports in zip(completions, test_list, test_imports)
+    ]
 
 
 # ── Memory callback ──────────────────────────────────────────────────────────
@@ -72,10 +62,8 @@ def main() -> None:
     model_name = args.model_path.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config via PEFT
-    peft_config = PeftConfig.from_pretrained(str(args.adapter_path))
-    rank = peft_config.r
-    target_modules = list(peft_config.target_modules)
+    # Read rank and target modules from adapter config
+    rank, target_modules = load_adapter_config(args.adapter_path)
 
     # Load training data (same as DS-MeZO)
     train_data = load_mbpp_train()

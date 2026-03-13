@@ -8,11 +8,10 @@ import json
 import time
 from pathlib import Path
 
-from eval.benchmarks import (
-    eval_mbpp, eval_humaneval, eval_sst2, eval_rte,
-    load_mbpp_train, load_apps_train,
-    make_exec_reward, setup_controller,
-)
+from ds_mezo import build_controller
+from eval.benchmarks import eval_mbpp, eval_humaneval, eval_sst2, eval_rte
+from eval.data import load_mbpp_train, load_apps_train
+from eval.rewards import make_exec_reward
 
 
 def _run_full_eval(llm, lora_request, n_samples, temperature):
@@ -72,7 +71,7 @@ def main() -> None:
         total_steps = max(max(eval_at_steps), total_steps)
 
     reward, set_problem = make_exec_reward()
-    llm, backend, controller, rank, _ = setup_controller(
+    llm, backend, controller, rank, _ = build_controller(
         args.model_path, args.adapter_path, args.output_dir, total_steps,
         score_fn=reward, calibration_prompt=train_data[0]["prompt"],
     )

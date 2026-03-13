@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-from ds_mezo.model_config import LayerSpec
+from ds_mezo.model_config import LayerSpec, load_adapter_config
 from ds_mezo.controller import DSMeZO_Controller, LayerState
-from eval.benchmarks import (
-    make_exec_reward, eval_mbpp, load_mbpp_train, load_apps_train,
-    load_adapter_config, setup_controller,
-)
+from ds_mezo import build_controller
+from eval.benchmarks import eval_mbpp
+from eval.data import load_mbpp_train, load_apps_train
+from eval.rewards import make_exec_reward
 
 
 def run_experiment(
@@ -39,7 +39,7 @@ def run_experiment(
 
     reward, set_problem = make_exec_reward()
 
-    _, backend, controller, _, _ = setup_controller(
+    _, backend, controller, _, _ = build_controller(
         model_path=None, adapter_path=adapter_path,
         output_dir=experiment_dir, total_steps=total_steps,
         score_fn=reward, engine=llm, layer_specs=layer_specs, rank=rank,
@@ -96,12 +96,13 @@ def patch_sgd_momentum(controller: DSMeZO_Controller) -> None:
         mom = self._momentum
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
-                key = (layer.key, suffix)
-                self.momentum_buffers[key].mul_(mom).add_((1 - mom) * dd * z_mat)
-                param.sub_(self.eta * self.momentum_buffers[key])
-        self.lr_scheduler.step()
-        self.eta = self._lr_opt.param_groups[0]["lr"]
+            for z_mat, param, mom_buf in [
+                (z_A, layer.A, layer.momentum_A),
+                (z_B, layer.B, layer.momentum_B),
+            ]:
+                mom_buf.mul_(mom).add_((1 - mom) * dd * z_mat)
+                param.sub_(self.eta * mom_buf)
+        self._step_lr()
 
     controller._update_weights = types.MethodType(sgd_update, controller)
 
@@ -147,13 +148,13 @@ def patch_no_kalman(controller: DSMeZO_Controller) -> None:
         mom = self._momentum
         for layer in self.layers:
             z_A, z_B = perturbations[layer.key]
-            for z_mat, suffix, param in [(z_A, "A", layer.A), (z_B, "B", layer.B)]:
-                key = (layer.key, suffix)
-                buf = self.momentum_buffers[key]
-                buf.mul_(mom).add_((1 - mom) * dd * z_mat)
-                zo_muon_update(param, buf, self.scratch_buffers[key], self.eta, self.norm_floor)
-        self.lr_scheduler.step()
-        self.eta = self._lr_opt.param_groups[0]["lr"]
+            for z_mat, param, mom_buf, scratch in [
+                (z_A, layer.A, layer.momentum_A, layer.scratch_A),
+                (z_B, layer.B, layer.momentum_B, layer.scratch_B),
+            ]:
+                mom_buf.mul_(mom).add_((1 - mom) * dd * z_mat)
+                zo_muon_update(param, mom_buf, scratch, self.eta, self.norm_floor)
+        self._step_lr()
 
     controller._update_weights = types.MethodType(ema_update, controller)
 
@@ -164,7 +165,7 @@ def patch_no_shrinkage(controller: DSMeZO_Controller) -> None:
     def vanilla_explore(self, batch):
         self.backend.sync_adapters({}, {}, self.layers)
         request_outputs = self.backend.generate(
-            batch, self.temperature, self.num_candidates
+            batch, self.TEMPERATURE, self.NUM_CANDIDATES
         )
         prompt_token_ids = request_outputs[0].prompt_token_ids
 
@@ -179,7 +180,7 @@ def patch_no_shrinkage(controller: DSMeZO_Controller) -> None:
         advantages = [float(a) for a in (rewards - baselines)]
 
         trajectories = [
-            list(prompt_token_ids) + list(out.token_ids) for out, _ in scored
+            prompt_token_ids + out.token_ids for out, _ in scored
         ]
         prompt_len = len(prompt_token_ids)
 
@@ -203,9 +204,10 @@ def patch_lora_init(controller: DSMeZO_Controller) -> None:
         torch.nn.init.kaiming_uniform_(layer.A, a=math.sqrt(5))
         torch.nn.init.zeros_(layer.B)
         norms.append(torch.linalg.norm(layer.A).item())
-        for key in [(layer.key, "A"), (layer.key, "B")]:
-            controller.momentum_buffers[key].zero_()
-            controller.variance_buffers[key].fill_(controller.eps ** 2)
+        layer.momentum_A.zero_()
+        layer.momentum_B.zero_()
+        layer.variance_A.fill_(controller.eps ** 2)
+        layer.variance_B.fill_(controller.eps ** 2)
     controller.eps = float(torch.tensor(norms).median()) * eps_dtype ** (1.0 / 3.0)
 
 

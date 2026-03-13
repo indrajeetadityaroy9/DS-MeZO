@@ -1,11 +1,13 @@
-"""Layer discovery via meta-device introspection (zero memory)."""
+"""Layer discovery and model config utilities."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from peft import PeftConfig
 from transformers import AutoConfig, AutoModelForCausalLM
 
 
@@ -41,3 +43,15 @@ def discover_layers(
         ))
 
     return sorted(specs, key=lambda s: (s.layer_idx, s.module_name))
+
+
+def load_adapter_config(adapter_path: str | Path) -> tuple[int, list[str]]:
+    """Read rank and target_modules from a PEFT adapter config."""
+    peft_config = PeftConfig.from_pretrained(str(adapter_path))
+    return peft_config.r, peft_config.target_modules
+
+
+def svd_power_iters(dtype: torch.dtype = torch.float32) -> int:
+    """Dtype-derived SVD power iteration count for warm-started convergence."""
+    eps = float(torch.finfo(dtype).eps)
+    return math.ceil(math.log(math.log(1.0 / eps) / math.log(2.0)) / math.log(3.0))

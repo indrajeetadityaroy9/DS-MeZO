@@ -3,20 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ds_mezo.model_config import svd_power_iters
 
-def _svd_power_iters() -> int:
-    eps_dtype = torch.finfo(torch.float32).eps
-    return math.ceil(math.log(math.log(1.0 / eps_dtype) / math.log(2.0)) / math.log(3.0))
-
-
-_SVD_NITER: int = _svd_power_iters()
+_SVD_NITER: int = svd_power_iters()
 
 
 def main() -> None:

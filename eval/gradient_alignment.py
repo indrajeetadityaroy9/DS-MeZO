@@ -16,7 +16,9 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ds_mezo.controller import DSMeZO_Controller
-from eval.benchmarks import load_mbpp_train, make_exec_reward, setup_controller
+from ds_mezo import build_controller
+from eval.data import load_mbpp_train
+from eval.rewards import make_exec_reward
 
 
 def _compute_bp_gradient(
@@ -84,7 +86,7 @@ def main() -> None:
     probe_steps = set(args.probe_steps)
 
     reward, set_problem = make_exec_reward()
-    llm, backend, controller, rank, layer_specs = setup_controller(
+    llm, backend, controller, rank, layer_specs = build_controller(
         args.model_path, args.adapter_path, args.output_dir, args.total_steps,
         score_fn=reward, calibration_prompt=train_data[0]["prompt"],
     )
@@ -104,8 +106,7 @@ def main() -> None:
 
         # Dynamic sampling: skip when advantages are below SPSA truncation floor
         if max(abs(a) for a in advantages) < self.eps:
-            self.lr_scheduler.step()
-            self.eta = self._lr_opt.param_groups[0]["lr"]
+            self._step_lr()
             return
 
         perturbations = self._perturb_and_sync(batch)
@@ -156,8 +157,6 @@ def main() -> None:
         step_result: dict[str, Any] = {"step": step, "dd": dd, "cosine_sim": {}}
         for layer in controller.layers:
             key = layer.key
-            if key not in bp_grads:
-                continue
             z_A, z_B = data["perturbations"][key]
             bp_A, bp_B = bp_grads[key]
 
@@ -174,7 +173,7 @@ def main() -> None:
             step_result["cosine_sim"][f"{layer_name}_B"] = cos_B
 
         # Aggregate across layers
-        all_cos = list(step_result["cosine_sim"].values())
+        all_cos = step_result["cosine_sim"].values()
         step_result["mean_cosine_sim"] = sum(all_cos) / len(all_cos)
         alignment_results.append(step_result)
 
