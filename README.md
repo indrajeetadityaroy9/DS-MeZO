@@ -1,4 +1,4 @@
-# Zeroth-Order RL LLM Post-Training on a Single GPU
+# Zeroth-Order Post-Training on a Single GPU
 
 RL post-training of large language models without backpropagation. It uses zeroth-order (ZO) gradient estimation via SPSA on PiSSA adapters to optimize non-differentiable reward signals — code execution, proof verification, tool use — at near-inference memory cost on a single GPU.
 
