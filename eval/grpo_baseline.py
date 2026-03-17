@@ -1,7 +1,3 @@
-"""GRPO baseline: backprop-based RL post-training via TRL GRPOTrainer."""
-
-from __future__ import annotations
-
 import argparse
 import json
 import time
@@ -17,21 +13,15 @@ from vllm.lora.request import LoRARequest
 from ds_mezo.backend import create_engine
 from ds_mezo.model_config import load_adapter_config
 from eval.benchmarks import eval_mbpp
-from eval.data import load_mbpp_train
-from eval.rewards import extract_code, _score_code_solution
+from eval.rewards import load_mbpp_train, extract_code, _score_code_solution
 
 
-# ── Reward function (TRL interface) ─────────────────────────────────────────
-
-def mbpp_exec_reward(completions: list[str], test_list: list,
-                     test_imports: list, **kwargs) -> list[float]:
+def mbpp_exec_reward(completions, test_list, test_imports, **kwargs):
     return [
         _score_code_solution(extract_code(c), tests, imports)
         for c, tests, imports in zip(completions, test_list, test_imports)
     ]
 
-
-# ── Memory callback ──────────────────────────────────────────────────────────
 
 class MemoryCallback(TrainerCallback):
     def __init__(self):
@@ -43,29 +33,22 @@ class MemoryCallback(TrainerCallback):
         self.peak_vram_mb = max(self.peak_vram_mb, used_mb)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="GRPO baseline (TRL)")
-    parser.add_argument("--model-path", type=Path, required=True,
-                        help="PiSSA residual model (same as DS-MeZO)")
-    parser.add_argument("--adapter-path", type=Path, required=True,
-                        help="PiSSA adapter (same as DS-MeZO)")
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--adapter-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-steps", type=int, default=1000)
     parser.add_argument("--n-samples", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--dsmezo-results", type=Path, required=True,
-                        help="Path to DS-MeZO rl_bench_results.json for comparison")
+    parser.add_argument("--dsmezo-results", type=Path, required=True)
     args = parser.parse_args()
 
     model_name = args.model_path.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read rank and target modules from adapter config
     rank, target_modules = load_adapter_config(args.adapter_path)
 
-    # Load training data (same as DS-MeZO)
     train_data = load_mbpp_train()
     dataset = Dataset.from_list(train_data)
 
@@ -76,8 +59,6 @@ def main() -> None:
     print(f"Eval: MBPP pass@k (n={args.n_samples}, T={args.temperature})")
     print("=" * 70)
 
-    # ── Pre-training baseline ────────────────────────────────────────────
-    # Evaluate PiSSA init weights via vLLM (identical to DS-MeZO's pre-eval)
     print("\nLoading vLLM engine for pre-training eval...")
     t0 = time.time()
 
@@ -162,7 +143,6 @@ def main() -> None:
     print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
 
     delta_1 = post_mbpp["pass@1"] - pre_mbpp["pass@1"]
-
     delta_10 = post_mbpp["pass@10"] - pre_mbpp["pass@10"]
     print(f"\n  pass@1: {pre_mbpp['pass@1']:.1%} → {post_mbpp['pass@1']:.1%} ({delta_1:+.1%})")
     print(f"  pass@10: {pre_mbpp['pass@10']:.1%} → {post_mbpp['pass@10']:.1%} ({delta_10:+.1%})")
@@ -194,14 +174,12 @@ def main() -> None:
     print(f"{'Method':<20} | {'pass@1 pre':>10} | {'pass@1 post':>11} | "
           f"{'Delta':>7} | {'Time':>7} | {'Peak VRAM':>9}")
     print("-" * 78)
-    # DS-MeZO row
-    dz_pre = dsmezo["pre_mbpp"]["pass@1"]
-    dz_post = dsmezo["post_mbpp"]["pass@1"]
-    dz_delta = dsmezo["delta_pass@1"]
+    dz_pre = dsmezo["pre"]["mbpp"]["pass@1"]
+    dz_post = dsmezo["post"]["mbpp"]["pass@1"]
+    dz_delta = dsmezo["delta_mbpp_pass@1"]
     dz_time = dsmezo["train_time"]
     print(f"{'DS-MeZO (ZO)':<20} | {dz_pre:>9.1%} | {dz_post:>10.1%} | "
           f"{dz_delta:>+6.1%} | {dz_time:>6.0f}s | {'~17 GB':>9}")
-    # GRPO row
     print(f"{'GRPO (backprop)':<20} | {pre_mbpp['pass@1']:>9.1%} | "
           f"{post_mbpp['pass@1']:>10.1%} | {delta_1:>+6.1%} | "
           f"{train_time:>6.0f}s | {peak_vram_gb:>7.1f} GB")

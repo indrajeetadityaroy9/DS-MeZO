@@ -1,15 +1,6 @@
-"""DS-MeZO training entry point.
-
-Sets GPU environment (clock locking, CUDA allocator, threading) and runs
-training. Replaces the former scripts/launch.sh.
-"""
-
-from __future__ import annotations
-
 import os
 import subprocess
 
-# Environment must be set before importing torch/vLLM.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
@@ -25,8 +16,7 @@ import yaml
 from ds_mezo import build_controller
 
 
-def _lock_gpu_clocks() -> None:
-    """Lock GPU to max supported clocks for deterministic timing."""
+def _lock_gpu_clocks():
     subprocess.run(["sudo", "nvidia-smi", "-pm", "1"], check=True,
                    capture_output=True)
     max_gfx = subprocess.run(
@@ -47,12 +37,11 @@ def _lock_gpu_clocks() -> None:
                    check=True, capture_output=True)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="DS-MeZO training")
-    parser.add_argument("--config", type=Path, required=True, help="Path to config YAML")
-    parser.add_argument("--prompts", type=Path, required=True, help="Path to prompts JSONL")
-    parser.add_argument("--lock-clocks", action="store_true",
-                        help="Lock GPU to max clocks (requires sudo)")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--prompts", type=Path, required=True)
+    parser.add_argument("--lock-clocks", action="store_true")
     args = parser.parse_args()
 
     if args.lock_clocks:

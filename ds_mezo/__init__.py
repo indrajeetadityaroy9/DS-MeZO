@@ -1,9 +1,4 @@
-"""DS-MeZO: Zeroth-order LLM fine-tuning via vLLM + Triton."""
-
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Any, Callable
 
 from ds_mezo.controller import DSMeZO_Controller
 from ds_mezo.backend import VLLMBackend, create_engine
@@ -11,19 +6,17 @@ from ds_mezo.model_config import LayerSpec, discover_layers, load_adapter_config
 
 
 def build_controller(
-    model_path: Path | str | None,
-    adapter_path: Path | str,
-    output_dir: Path | str,
-    total_steps: int,
-    score_fn: Callable | None = None,
-    calibration_prompt: str | None = None,
-    engine: Any = None,
-    layer_specs: list | None = None,
-    rank: int | None = None,
-    extra_config: dict[str, Any] | None = None,
-) -> tuple[Any, VLLMBackend, DSMeZO_Controller, int, list]:
-    """Build vLLM engine (or reuse), create backend + controller, calibrate.
-    Returns (engine, backend, controller, rank, layer_specs)."""
+    model_path=None,
+    adapter_path=None,
+    output_dir=None,
+    total_steps=None,
+    score_fn=None,
+    calibration_prompt=None,
+    engine=None,
+    layer_specs=None,
+    rank=None,
+    extra_config=None,
+):
     if rank is None:
         rank, target_modules = load_adapter_config(adapter_path)
     else:
@@ -33,7 +26,7 @@ def build_controller(
     if layer_specs is None:
         layer_specs = discover_layers(model_path, target_modules)
     backend = VLLMBackend(engine, layer_specs, rank)
-    config: dict[str, Any] = {
+    config = {
         "output_dir": str(output_dir),
         "adapter_path": str(adapter_path),
         "total_steps": total_steps,

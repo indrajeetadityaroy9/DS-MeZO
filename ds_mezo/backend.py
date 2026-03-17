@@ -1,17 +1,41 @@
-"""vLLM backend: adapter hot-swap, scoring, and activation extraction."""
-
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Any
 
 import torch
+from peft import LoraConfig
+from safetensors.torch import save_file
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from ds_mezo.adapter_io import save_peft_adapter, write_adapter_config
 
-def create_engine(model_path: str | Path, rank: int) -> LLM:
+def write_adapter_config(adapter_dir, rank, target_modules):
+    config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        target_modules=target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    config.save_pretrained(str(adapter_dir))
+
+
+def save_peft_adapter(A_list, B_list, adapter_dir, layers, bf16_cache):
+    # lora_A.weight = B, lora_B.weight = A (PiSSA/PEFT swap)
+    tensors = {}
+    for layer_idx, (A_l, B_l) in enumerate(zip(A_list, B_list)):
+        prefix = layers[layer_idx].peft_prefix
+        key_a = f"{prefix}.lora_A.weight"
+        key_b = f"{prefix}.lora_B.weight"
+        if key_a not in bf16_cache:
+            bf16_cache[key_a] = torch.empty_like(B_l, dtype=torch.bfloat16)
+            bf16_cache[key_b] = torch.empty_like(A_l, dtype=torch.bfloat16)
+        bf16_cache[key_a].copy_(B_l)
+        bf16_cache[key_b].copy_(A_l)
+        tensors[key_a] = bf16_cache[key_a]
+        tensors[key_b] = bf16_cache[key_b]
+
+    save_file(tensors, str(adapter_dir / "adapter_model.safetensors"))
+
+def create_engine(model_path, rank):
     return LLM(
         model=str(model_path),
         dtype="bfloat16",
@@ -22,15 +46,13 @@ def create_engine(model_path: str | Path, rank: int) -> LLM:
     )
 
 
-_VLLM_MERGES: dict[str, str] = {
+_VLLM_MERGES = {
     "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
     "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj",
 }
 
 
-def _register_activation_hooks(
-    worker: Any, hook_map: dict[str, list[str]],
-) -> int:
+def _register_activation_hooks(worker, hook_map):
     model = worker.get_model()
     worker._ds_mezo_hooks = []
     worker._ds_mezo_activations = {}
@@ -44,10 +66,7 @@ def _register_activation_hooks(
         layer_idx = int(parts[layers_pos + 1])
         keys = [(layer_idx, mod) for mod in hook_map[suffix]]
 
-        def hook_fn(
-            mod: Any, inp: tuple[torch.Tensor, ...], out: Any,
-            ks: list[tuple[int, str]] = keys,
-        ) -> None:
+        def hook_fn(mod, inp, out, ks=keys):
             act = inp[0].detach().float()
             for k in ks:
                 worker._ds_mezo_activations[k] = act
@@ -56,11 +75,9 @@ def _register_activation_hooks(
     return len(worker._ds_mezo_hooks)
 
 
-def _collect_and_remove_hooks(
-    worker: Any,
-) -> dict[tuple[int, str], torch.Tensor]:
-    seen: dict[int, torch.Tensor] = {}
-    activations: dict[tuple[int, str], torch.Tensor] = {}
+def _collect_and_remove_hooks(worker):
+    seen = {}
+    activations = {}
     for k, v in worker._ds_mezo_activations.items():
         tid = id(v)
         if tid not in seen:
@@ -76,10 +93,7 @@ def _collect_and_remove_hooks(
     return activations
 
 
-def _extract_prompt_logprobs(
-    output: Any, prompt_token_ids: list[int],
-) -> list[float]:
-    """Extract per-token logprobs from vLLM output."""
+def _extract_prompt_logprobs(output, prompt_token_ids):
     logprobs = []
     for i, token_lp in enumerate(output.prompt_logprobs[1:], 1):
         tok_id = prompt_token_ids[i]
@@ -88,20 +102,15 @@ def _extract_prompt_logprobs(
 
 
 class VLLMBackend:
-    def __init__(
-        self, engine: Any, layer_specs: list[Any], rank: int,
-        staging_dir: Path | str = Path("/dev/shm/ds_mezo"),
-    ) -> None:
+    def __init__(self, engine, layer_specs, rank, staging_dir=Path("/dev/shm/ds_mezo")):
         self.engine = engine
         self.rank = rank
 
-        hook_map: dict[str, set[str]] = {}
+        hook_map = {}
         for ls in layer_specs:
             vllm_name = _VLLM_MERGES.get(ls.module_name, ls.module_name)
             hook_map.setdefault(vllm_name, set()).add(ls.module_name)
-        self.hook_map: dict[str, list[str]] = {
-            k: sorted(v) for k, v in hook_map.items()
-        }
+        self.hook_map = {k: sorted(v) for k, v in hook_map.items()}
 
         unique_modules = sorted({ls.module_name for ls in layer_specs})
         staging = Path(staging_dir)
@@ -120,19 +129,12 @@ class VLLMBackend:
             max_tokens=1, prompt_logprobs=1, temperature=0.0
         )
 
-        self._bf16_pos: dict[str, torch.Tensor] = {}
-        self._bf16_neg: dict[str, torch.Tensor] = {}
+        self._bf16_pos = {}
+        self._bf16_neg = {}
         self.query_count = 0
 
-    def sync_adapters(
-        self,
-        pos_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
-        neg_overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
-        layers: list[Any],
-    ) -> None:
-        def get_AB(
-            overrides: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]],
-        ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def sync_adapters(self, pos_overrides, neg_overrides, layers):
+        def get_AB(overrides):
             A_list, B_list = [], []
             for layer in layers:
                 k = layer.key
@@ -153,18 +155,14 @@ class VLLMBackend:
         self.engine.llm_engine.add_lora(self.lora_pos)
         self.engine.llm_engine.add_lora(self.lora_neg)
 
-    def generate(
-        self, batch: list[str], temperature: float, n: int,
-    ) -> list[Any]:
+    def generate(self, batch, temperature, n):
         self.query_count += len(batch) * n
         gen_params = SamplingParams(n=n, temperature=temperature)
         return self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
         )
 
-    def score(
-        self, token_sequences: list[list[int]], lora_request: LoRARequest,
-    ) -> list[list[float]]:
+    def score(self, token_sequences, lora_request):
         self.query_count += len(token_sequences)
         prompts = [{"prompt_token_ids": seq} for seq in token_sequences]
         outputs = self.engine.generate(
@@ -175,9 +173,7 @@ class VLLMBackend:
             for out, seq in zip(outputs, token_sequences)
         ]
 
-    def extract_activations(
-        self, input_data: list[str],
-    ) -> dict[tuple[int, str], torch.Tensor]:
+    def extract_activations(self, input_data):
         self.query_count += len(input_data)
         self.engine.collective_rpc(
             _register_activation_hooks, args=(self.hook_map,)

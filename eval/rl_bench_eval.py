@@ -1,30 +1,20 @@
-"""DS-MeZO RL proof-of-concept: train on MBPP/APPS, evaluate pass@k on
-MBPP + HumanEval + SST-2 + RTE. Supports mid-loop scaling curve evaluation."""
-
-from __future__ import annotations
-
 import argparse
 import json
 import time
 from pathlib import Path
 
 from ds_mezo import build_controller
-from eval.benchmarks import eval_mbpp, eval_humaneval, eval_sst2, eval_rte
-from eval.data import load_mbpp_train, load_apps_train
-from eval.rewards import make_exec_reward
+from eval.benchmarks import eval_mbpp, eval_humaneval
+from eval.rewards import load_mbpp_train, load_apps_train, make_exec_reward
 
 
 def _run_full_eval(llm, lora_request, n_samples, temperature):
-    """Run all benchmarks and return combined results dict."""
     mbpp = eval_mbpp(llm, lora_request=lora_request, n_samples=n_samples, temperature=temperature)
     humaneval = eval_humaneval(llm, lora_request=lora_request, n_samples=n_samples, temperature=temperature)
-    sst2 = eval_sst2(llm, lora_request=lora_request, n_shot=8)
-    rte = eval_rte(llm, lora_request=lora_request, n_shot=8)
-    return {"mbpp": mbpp, "humaneval": humaneval, "sst2": sst2, "rte": rte}
+    return {"mbpp": mbpp, "humaneval": humaneval}
 
 
 def _print_eval(results, label):
-    """Print evaluation results."""
     print(f"\n--- {label} ---")
     mbpp = results["mbpp"]
     ci = mbpp['pass@1_ci95']
@@ -35,15 +25,9 @@ def _print_eval(results, label):
     he = results["humaneval"]
     ci = he['pass@1_ci95']
     print(f"  HumanEval pass@1: {he['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {he['num_tasks']} tasks)")
-    sst2 = results["sst2"]
-    ci = sst2['accuracy_ci95']
-    print(f"  SST-2 accuracy: {sst2['accuracy']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%})")
-    rte = results["rte"]
-    ci = rte['accuracy_ci95']
-    print(f"  RTE accuracy: {rte['accuracy']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%})")
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="DS-MeZO RL proof-of-concept")
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--adapter-path", type=Path, required=True)
@@ -52,8 +36,7 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--train-data", choices=["mbpp", "apps"], default="mbpp")
-    parser.add_argument("--eval-at-steps", type=int, nargs="+", default=None,
-                        help="Evaluate at these training steps for scaling curves")
+    parser.add_argument("--eval-at-steps", type=int, nargs="+", default=None)
     args = parser.parse_args()
 
     model_name = args.model_path.name
@@ -80,7 +63,7 @@ def main() -> None:
     print("DS-MeZO RL PROOF-OF-CONCEPT")
     print(f"Model: {model_name} | PiSSA rank-{rank}")
     print(f"Train: {len(train_data)} {args.train_data} problems | Steps: {total_steps}")
-    print(f"Eval: MBPP + HumanEval + SST-2 + RTE (n={args.n_samples}, T={args.temperature})")
+    print(f"Eval: MBPP + HumanEval (n={args.n_samples}, T={args.temperature})")
     if eval_at_steps:
         print(f"Scaling checkpoints: {sorted(eval_at_steps)}")
     print("=" * 70)
@@ -98,11 +81,7 @@ def main() -> None:
         set_problem(problem["test_list"], problem["test_imports"])
         controller.step([problem["prompt"]])
 
-        log.append({
-            "step": step_idx + 1,
-            "eta": controller.eta,
-            "eps": controller.eps,
-        })
+        log.append({"step": step_idx + 1, "eta": controller.eta, "eps": controller.eps})
 
         if (step_idx + 1) % 100 == 0:
             print(f"  step {step_idx+1}/{total_steps} | lr={controller.eta:.2e}")
@@ -113,10 +92,7 @@ def main() -> None:
             checkpoint_results = _run_full_eval(
                 llm, backend.lora_pos, args.n_samples, args.temperature,
             )
-            scaling_checkpoints.append({
-                "step": step_idx + 1,
-                "results": checkpoint_results,
-            })
+            scaling_checkpoints.append({"step": step_idx + 1, "results": checkpoint_results})
             _print_eval(checkpoint_results, f"Step {step_idx+1}")
 
     train_time = time.time() - t_start
@@ -129,8 +105,6 @@ def main() -> None:
     delta_1 = post_results["mbpp"]['pass@1'] - pre_results["mbpp"]['pass@1']
     print(f"\n  MBPP pass@1: {pre_results['mbpp']['pass@1']:.1%} → {post_results['mbpp']['pass@1']:.1%} ({delta_1:+.1%})")
     print(f"  HumanEval pass@1: {pre_results['humaneval']['pass@1']:.1%} → {post_results['humaneval']['pass@1']:.1%}")
-    print(f"  SST-2: {pre_results['sst2']['accuracy']:.1%} → {post_results['sst2']['accuracy']:.1%}")
-    print(f"  RTE: {pre_results['rte']['accuracy']:.1%} → {post_results['rte']['accuracy']:.1%}")
     print(f"  Time: {train_time:.1f}s ({train_time/total_steps:.1f}s/step)")
     print(f"  Total forward passes: {backend.query_count}")
 

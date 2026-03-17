@@ -1,7 +1,3 @@
-"""PiSSA decomposition: pretrained model → W_res + PEFT adapter."""
-
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
@@ -11,20 +7,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ds_mezo.model_config import svd_power_iters
 
-_SVD_NITER: int = svd_power_iters()
+_SVD_NITER = svd_power_iters()
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="PiSSA decomposition")
-    parser.add_argument("--model", type=Path, required=True, help="Path to pretrained model")
-    parser.add_argument("--output", type=Path, required=True, help="Output directory")
-    parser.add_argument("--rank", type=int, default=16, help="PiSSA decomposition rank")
-    parser.add_argument("--targets", nargs="+", default=["q_proj", "v_proj"],
-                        help="Target module names")
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--targets", nargs="+", default=["q_proj", "v_proj"])
     args = parser.parse_args()
 
-    model_path: Path = args.model
-    output_dir: Path = args.output
+    model_path = args.model
+    output_dir = args.output
     rank = args.rank
     target_modules = args.targets
     residual_dir = output_dir / "residual"

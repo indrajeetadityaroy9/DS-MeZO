@@ -1,90 +1,3 @@
-"""Triton kernels for DS-MeZO — Hopper-native (sm_90), H100-validated.
-
-Kernel 1: zo_muon_update — fuses Frobenius normalization, Newton-Schulz
-    orthogonalization, and parameter update into a single kernel launch per
-    adapter matrix. Dispatches tall (M>=N, tiles rows) vs wide (M<N, tiles
-    columns). Kalman gradient estimation happens in Python before the kernel
-    call. Mechanism-critical: this IS the ZO-Muon spectral optimizer.
-
-Kernel 2: fused_power_iter — warm-started power iteration for activation
-    subspace tracking. Fuses num_iters×(H.T@H@V + QR) → 1 kernel launch
-    per layer. Mechanism-critical: this IS the AGZO activation subspace tracker.
-
-Kernel 3: fused_agzo_perturbation — fuses the entire AGZO perturbation
-    pipeline: z_B projection through activation basis V, BV accumulation,
-    QR(BV) for column-space basis Q, z_A projection through Q. Replaces
-    6 launches per layer with 1. Mechanism-critical: this IS the AGZO
-    perturbation generator.
-
-Kernel 4: fused_perturb_dual — computes θ+ = base + z and θ- = base - z
-    in a single pass. Multi-CTA elementwise. Saves ~64 kernel launches/step.
-
-H100 (sm_90) audit conclusions:
-
-  Precision — FP32 + allow_tf32=False verified optimal:
-    All tl.dot inner products have at least one narrow dimension (R=16 or
-    RC≈8). At R=16, Gram products are exactly one 16×16 HMMA tile — no
-    throughput benefit over FP32 CUDA cores, and TF32's 10-bit mantissa
-    would degrade N-S convergence precision. BF16 would break N-S convergence
-    outright. FP8/Transformer Engine not applicable (optimizer math, not
-    inference). No dtype change is justified on Hopper for this workload.
-
-  Parallelism — single-CTA grid=(1,) forced by algorithm:
-    Kernels 1-3 have serial data dependencies. ZO-Muon N-S iterations require
-    the full Gram matrix G = X^T@X before applying S = c₁I + c₃G to all rows.
-    Power iteration accumulates H^T@(H@V) across all tokens before QR. AGZO
-    accumulates BV across all d_in before QR. Multi-CTA parallelism, TMA
-    producer/consumer overlap, and warp specialization all require independent
-    work across CTAs — not applicable to serial-accumulation algorithms.
-    Kernel 4 is multi-CTA (elementwise, independent per element).
-
-  Memory hierarchy — L2-resident, TMA unnecessary:
-    Adapter matrices: A (d_out×r) + B (r×d_in) ≈ 256KB for r=16, d=4096.
-    Activation batch: H (T×D) + V (D×R) ≈ 8MB for T=512, D=4096, R=8.
-    Total ≈ 8.5MB ≪ H100 50MB L2 cache. Multi-pass sequential reads from L2
-    are efficient without TMA async tensor movement.
-
-  Tile sizes — H100 SRAM-aligned:
-    BLOCK_M=128, BLOCK_N=128, BLOCK_T=128, BLOCK_D=128: power-of-2 for H100
-    SRAM bank alignment. For d_in=4096 → 32 chunks/pass, each 128×16=8KB FP32.
-    BLOCK=1024 for elementwise kernel 4: standard load/store tile. No autotune
-    needed — single shape class per variant, deterministic tile sizes.
-
-  Pointer arithmetic — Triton 3.6.0 stability:
-    Raw stride-based pointer arithmetic with explicit masking. No block pointers
-    (tl.make_block_ptr/tl.advance have documented instability in loop structures
-    on Hopper in Triton 3.6.0). No experimental APIs (tl.async_copy, etc.).
-
-  Total kernel overhead — <1% of step time:
-    161 kernel launches/step, ~620μs total. Against vLLM inference (4 generate/
-    score calls, ~100ms+), kernel compute is <1% of wall time. All four kernels
-    are mechanism-critical and remain on the active execution path.
-
-Invariant constants (mathematically fixed, not tunable):
-  - Newton-Schulz: minimax-optimal degree-3 composition via Equioscillation
-    Theorem (Amsel et al. 2025, arXiv:2505.16932). Closed-form per iteration:
-    S = c₁·I + c₃·(X^T@X). Greedy composition is globally optimal (Theorem 4.1).
-    Convergence basin ℓ = √ε_f32 (Gram matrix roundoff floor: σ² < ε → σ below
-    representable precision in G = X^T@X). Produces 12 iterations empirically.
-    Performance: 12×2+3 = 27 passes per call, ~135μs/step total (<0.2%).
-  - Norm floor = finfo.tiny. Derived from dtype.
-  - BLOCK_*=128: power-of-2 for H100 SRAM alignment.
-
-Tensor conventions:
-  - All inputs: FP32, 2D, contiguous, CUDA.
-  - Adapter rank >= 16 (tl.dot contraction minimum on Hopper).
-  - zo_muon_update: param, buf, scratch — identical shape.
-  - fused_power_iter: H (T, D), V (D, R). D and R padded to next power of 2
-    internally. Register pressure: V tile is next_power_of_2(D) × next_power_of_2(R)
-    FP32 values. For D=4096, R=8 → 128KB, near H100 256KB register file limit.
-    Spilling possible for larger D/R but acceptable (single call/step).
-  - fused_agzo_perturbation: B (R, d_in), V (d_in, RC), z_coeff_B (R, RC),
-    z_coeff_A (d_out, RC). R and RC are constexpr. z_coeff tensors must be
-    contiguous (kernel uses hardcoded stride=RC for second dimension).
-  - fused_perturb_dual: base, z, pos, neg — identical shape, must be contiguous
-    (kernel uses flat .numel() indexing).
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -102,15 +15,7 @@ import triton.language as tl
 # Kernel form: S = c1·I + c3·(X^T@X), same as Newton-Schulz.
 
 
-def _ns_coefficients() -> tuple[tuple[float, float], ...]:
-    """Minimax-optimal degree-3 N-S coefficients, iterating to convergence.
-
-    Starting bound ell = sqrt(eps_f32): the Gram matrix G = X^T@X has entries
-    involving sigma_i^2. When sigma_i < sqrt(eps), sigma_i^2 < eps and that
-    SV's contribution to G is indistinguishable from FP32 roundoff. Iteration
-    count falls out of the convergence criterion (1 - p(ell) < eps).
-    Per-iteration coefficients from Equioscillation Theorem (Amsel et al. 2025).
-    """
+def _ns_coefficients():
     eps = float(torch.finfo(torch.float32).eps)
     l, u = eps ** 0.5, 1.0
     coeffs = []
@@ -291,20 +196,7 @@ def _zo_muon_wide_kernel(
         tl.store(param_ptr + ptrs, param_tile - eta * orth_tile, mask=mask)
 
 
-def zo_muon_update(
-    param: torch.Tensor,
-    buf: torch.Tensor,
-    scratch: torch.Tensor,
-    eta: float,
-    norm_floor: float,
-) -> None:
-    """Frobenius normalize → minimax Newton-Schulz → param update.
-
-    buf contains the Kalman posterior mean (updated in Python before this call).
-    Dispatches tall (M >= N) vs wide (M < N) kernel. Both forms use
-    min(M,N) × min(M,N) inner products (= rank × rank, minimum 16×16).
-    N-S coefficients from minimax-optimal degree-3 composition (Polar Express).
-    """
+def zo_muon_update(param, buf, scratch, eta, norm_floor):
     M, N = param.shape
     if M >= N:
         _zo_muon_tall_kernel[(1,)](
@@ -399,17 +291,7 @@ def _power_iter_kernel(
     )
 
 
-def fused_power_iter(
-    H: torch.Tensor,
-    V: torch.Tensor,
-    num_iters: int,
-    norm_floor: float,
-) -> torch.Tensor:
-    """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
-
-    Handles arbitrary D and R via pad-to-next-power-of-2 with masking.
-    H: (T, D), V: (D, R).
-    """
+def fused_power_iter(H, V, num_iters, norm_floor):
     T, D = H.shape
     _, R = V.shape
 
@@ -554,24 +436,11 @@ def _agzo_perturb_kernel(
         )
 
 
-def fused_agzo_perturbation(
-    B: torch.Tensor,
-    V: torch.Tensor,
-    z_coeff_B: torch.Tensor,
-    z_coeff_A: torch.Tensor,
-    eps: float,
-    norm_floor: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused AGZO perturbation: compute z_A and z_B in a single kernel.
+def fused_agzo_perturbation(B, V, z_coeff_B, z_coeff_A, eps, norm_floor):
+    assert z_coeff_B.is_contiguous() and z_coeff_A.is_contiguous(), (
+        "z_coeff tensors must be C-contiguous (kernel uses hardcoded stride=RC)"
+    )
 
-    Replaces per-layer: z_B = (z_coeff_B @ V.T) * eps, BV = B @ V,
-    Q = QR(BV), z_A = (z_coeff_A @ Q.T) * eps. Fuses 6 launches into 1.
-    B: (R, d_in), V: (d_in, RC), z_coeff_B: (R, RC), z_coeff_A: (d_out, RC).
-    Returns (z_A, z_B) where z_A is (d_out, R) and z_B is (R, d_in).
-
-    Note: z_coeff_B and z_coeff_A must be contiguous — the kernel indexes
-    them with hardcoded stride=(cols, 1) matching the constexpr RC dimension.
-    """
     R, d_in = B.shape
     _, RC = V.shape
     d_out, _ = z_coeff_A.shape
@@ -615,17 +484,7 @@ def _perturb_dual_kernel(
     tl.store(neg_ptr + offs, base - z, mask=mask)
 
 
-def fused_perturb_dual(
-    base: torch.Tensor,
-    z: torch.Tensor,
-    pos: torch.Tensor,
-    neg: torch.Tensor,
-) -> None:
-    """Fused dual perturbation: pos = base + z, neg = base - z.
-
-    Writes into pre-allocated pos and neg buffers.
-    Inputs must not alias outputs (no in-place: base != pos, z != neg, etc.).
-    """
+def fused_perturb_dual(base, z, pos, neg):
     N = base.numel()
     BLOCK = 1024
     grid = ((N + BLOCK - 1) // BLOCK,)
