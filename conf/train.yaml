@@ -1,0 +1,24 @@
+model:
+  path: ???
+  adapter_path: ???
+
+training:
+  total_steps: 1000
+  seed: 42
+
+eval:
+  n_samples: 20
+  temperature: 0.2
+  eval_at_steps: []
+
+data:
+  train_data: mbpp
+
+system:
+  lock_clocks: false
+
+output_dir: ???
+
+hydra:
+  run:
+    dir: ${output_dir}

@@ -1,5 +1,6 @@
 import functools
 import json
+import os
 import re
 
 import evaluate
@@ -8,6 +9,7 @@ from datasets import load_dataset
 
 @functools.lru_cache(maxsize=1)
 def _get_code_eval():
+    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     return evaluate.load("code_eval")
 
 

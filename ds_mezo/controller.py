@@ -1,25 +1,15 @@
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from optht import optht
 from safetensors.torch import load_file, save_file
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
 from ds_mezo.backend import save_peft_adapter, write_adapter_config
 from ds_mezo.kernels import zo_muon_update, fused_power_iter, fused_agzo_perturbation, fused_perturb_dual
 from ds_mezo.model_config import LayerSpec, svd_power_iters
-
-_CONFIG_DEFAULTS = {
-    "staging_dir": "/dev/shm/ds_mezo",
-    "seed": 42,
-    "score_fn": lambda text: 0.0,
-    "resume_from": None,
-}
-
 
 def _mean_nll(logprobs):
     return -sum(logprobs) / len(logprobs)
@@ -32,16 +22,16 @@ class LayerState:
     layer_idx: int
     module_name: str
     peft_prefix: str
-    momentum_A: torch.Tensor
-    momentum_B: torch.Tensor
-    variance_A: torch.Tensor
-    variance_B: torch.Tensor
-    scratch_A: torch.Tensor
-    scratch_B: torch.Tensor
-    pos_A: torch.Tensor
-    pos_B: torch.Tensor 
-    neg_A: torch.Tensor
-    neg_B: torch.Tensor
+    momentum_A: torch.Tensor = None
+    momentum_B: torch.Tensor = None
+    variance_A: torch.Tensor = None
+    variance_B: torch.Tensor = None
+    scratch_A: torch.Tensor = None
+    scratch_B: torch.Tensor = None
+    pos_A: torch.Tensor = None
+    pos_B: torch.Tensor = None
+    neg_A: torch.Tensor = None
+    neg_B: torch.Tensor = None
 
     @property
     def key(self):
@@ -51,24 +41,21 @@ class LayerState:
 class DSMeZO_Controller:
     NUM_CANDIDATES = 4
 
-    def __init__(self, backend, layer_specs, config):
+    def __init__(self, backend, layer_specs, cfg, score_fn):
         self.backend = backend
-
-        cfg = {**_CONFIG_DEFAULTS, **config}
-
-        self.score_fn = cfg["score_fn"]
+        self.score_fn = score_fn
         self.step_count = 0
-        self.total_steps = cfg["total_steps"]
+        self.total_steps = cfg.training.total_steps
 
-        self.output_dir = Path(cfg["output_dir"])
+        self.output_dir = Path(cfg.output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.rng = torch.Generator(device="cuda")
-        self.rng.manual_seed(cfg["seed"])
+        self.rng.manual_seed(cfg.training.seed)
 
         adapter_tensors = load_file(
-            str(Path(cfg["adapter_path"]) / "adapter_model.safetensors"),
+            str(Path(cfg.model.adapter_path) / "adapter_model.safetensors"),
             device="cuda",
         )
 
@@ -95,13 +82,10 @@ class DSMeZO_Controller:
         self.eps = float(torch.median(norms)) * float(eps_machine) ** (1.0 / 3.0)
 
         # eta_max = eps — trust-region: step ≤ perturbation radius
+        # eta_min = eps × ε^(1/3) — consistent precision hierarchy (same scaling as eps derivation)
         self.eta_max = self.eps
+        self.eta_min = self.eta_max * float(eps_machine) ** (1.0 / 3.0)
         self.eta = self.eta_max
-        self._lr_param = torch.nn.Parameter(torch.empty(0, device="cuda"))
-        self._lr_opt = torch.optim.SGD([self._lr_param], lr=self.eta_max)
-        self.lr_scheduler = CosineAnnealingLR(
-            self._lr_opt, T_max=self.total_steps, eta_min=0.0,
-        )
 
         for layer in self.layers:
             layer.momentum_A = torch.zeros_like(layer.A)
@@ -123,8 +107,8 @@ class DSMeZO_Controller:
         self.power_iter_steps = svd_power_iters()
         self.norm_floor = torch.finfo(torch.float32).tiny
 
-        if cfg["resume_from"]:
-            self._load_checkpoint(Path(cfg["resume_from"]))
+        if cfg.training.resume_from:
+            self._load_checkpoint(Path(cfg.training.resume_from))
 
     def _load_checkpoint(self, checkpoint_dir):
         tensors = load_file(str(checkpoint_dir / "optimizer_state.safetensors"), device="cuda")
@@ -144,14 +128,11 @@ class DSMeZO_Controller:
         with open(checkpoint_dir / "training_state.json") as f:
             state = json.load(f)
         self.step_count = state["step"]
-        self.eta = state["eta"]
         self.reward_ema = state["reward_ema"]
-        self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        self._step_lr()
         self.r_calib = self.activation_bases[self.layers[0].key].shape[1]
 
-    def _calibrate_activation_bases_full(self, input_data):
-        activations = self.backend.extract_activations(input_data)
-
+    def _calibrate_activation_bases(self, activations):
         gpu_acts = {}
         for layer in self.layers:
             act = activations[layer.key]
@@ -212,8 +193,8 @@ class DSMeZO_Controller:
         return fused_agzo_perturbation(B, V_l, z_coeff_B, z_coeff_A, self.eps, self.norm_floor)
 
     def _score_contrastive(self, trajectories, advantages, prompt_len):
-        lp_pos = [lp[prompt_len:] for lp in self.backend.score(trajectories, self.backend.lora_pos)]
-        lp_neg = [lp[prompt_len:] for lp in self.backend.score(trajectories, self.backend.lora_neg)]
+        lp_pos = [lp[prompt_len - 1:] for lp in self.backend.score(trajectories, self.backend.lora_pos)]
+        lp_neg = [lp[prompt_len - 1:] for lp in self.backend.score(trajectories, self.backend.lora_neg)]
 
         loss_pos = sum(adv * _mean_nll(lp) for adv, lp in zip(advantages, lp_pos))
         loss_neg = sum(adv * _mean_nll(lp) for adv, lp in zip(advantages, lp_neg))
@@ -222,7 +203,7 @@ class DSMeZO_Controller:
 
     def _explore(self, batch):
         self.backend.sync_adapters({}, {}, self.layers)
-        request_outputs = self.backend.generate(
+        request_outputs, activations = self.backend.generate_with_activations(
             batch, 1.0, self.NUM_CANDIDATES
         )
         prompt_token_ids = request_outputs[0].prompt_token_ids
@@ -250,11 +231,10 @@ class DSMeZO_Controller:
         ]
         prompt_len = len(prompt_token_ids)
 
-        return trajectories, advantages, prompt_len
+        return trajectories, advantages, prompt_len, activations
 
-    def _perturb_and_sync(self, batch):
-        batch_activations = self.backend.extract_activations(batch)
-        self._update_activation_bases(batch_activations)
+    def _perturb_and_sync(self, activations):
+        self._update_activation_bases(activations)
 
         perturbations = {l.key: self._get_perturbation(l) for l in self.layers}
 
@@ -289,8 +269,8 @@ class DSMeZO_Controller:
                 y_hat += (z_mat * mu).sum()
                 s_sum += (z_mat * z_mat * var).sum()
 
-        S = s_sum.item() + self.norm_floor
-        innovation = dd - y_hat.item()
+        S = s_sum + self.norm_floor
+        innovation = dd - y_hat
         inv_S = 1.0 / S
 
         # Pass 2: Kalman observation update + N-S orthogonalization
@@ -308,40 +288,24 @@ class DSMeZO_Controller:
         self._step_lr()
 
     def _step_lr(self):
-        self.lr_scheduler.step()
-        self.eta = self._lr_opt.param_groups[0]["lr"]
+        t = self.step_count
+        self.eta = self.eta_min + 0.5 * (self.eta_max - self.eta_min) * (1.0 + math.cos(math.pi * t / self.total_steps))
 
     def step(self, batch):
         self.step_count += 1
-        trajectories, advantages, prompt_len = self._explore(batch)
+        trajectories, advantages, prompt_len, activations = self._explore(batch)
 
-        if max(abs(a) for a in advantages) < self.eps:
+        if not any(advantages):
             self._step_lr()
             return
 
-        perturbations = self._perturb_and_sync(batch)
+        if self.r_calib == 0:
+            self._calibrate_activation_bases(activations)
+
+        perturbations = self._perturb_and_sync(activations)
         loss_pos, loss_neg = self._score_contrastive(trajectories, advantages, prompt_len)
         dd = float(loss_pos - loss_neg) / (2.0 * self.eps)
         self._update_weights(perturbations, dd)
-
-    def train(self, prompts):
-        log_interval = self.total_steps // 100
-        ckpt_interval = self.total_steps // 10
-
-        for step_idx in range(self.step_count, self.total_steps):
-            batch = [prompts[step_idx % len(prompts)]]
-            self.step(batch)
-
-            if (step_idx + 1) % log_interval == 0:
-                print(
-                    f"step={step_idx + 1}/{self.total_steps} "
-                    f"lr={self.eta:.2e}"
-                )
-
-            if (step_idx + 1) % ckpt_interval == 0:
-                self._save_checkpoint(step_idx + 1)
-
-        self._save_checkpoint(self.total_steps)
 
     def _save_checkpoint(self, step):
         step_dir = self.checkpoint_dir / f"step_{step}"
@@ -372,14 +336,8 @@ class DSMeZO_Controller:
             "step": step,
             "eta": self.eta,
             "reward_ema": self.reward_ema,
-            "lr_scheduler": self.lr_scheduler.state_dict(),
         }
         with open(step_dir / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2)
-
-        adapter_dir = self.output_dir / "adapter"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        save_peft_adapter(A_list, B_list, adapter_dir, self.layers, self._bf16_ckpt)
-        write_adapter_config(adapter_dir, rank, target_modules)
 
         print(f"Checkpoint saved: {step_dir}")

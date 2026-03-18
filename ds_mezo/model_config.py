@@ -11,7 +11,6 @@ from transformers import AutoConfig, AutoModelForCausalLM
 class LayerSpec:
     layer_idx: int
     module_name: str
-    weight_key: str
     peft_prefix: str
 
 
@@ -32,7 +31,6 @@ def discover_layers(model_path, target_modules):
         specs.append(LayerSpec(
             layer_idx=layer_idx,
             module_name=suffix,
-            weight_key=name + ".weight",
             peft_prefix="base_model.model." + name,
         ))
 

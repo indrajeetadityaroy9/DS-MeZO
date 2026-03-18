@@ -1,0 +1,12 @@
+model:
+  path: ???
+  rank: 16
+  targets:
+    - q_proj
+    - v_proj
+
+output_dir: ???
+
+hydra:
+  run:
+    dir: ${output_dir}

@@ -1,10 +1,11 @@
-import argparse
 import json
 import time
 from pathlib import Path
 
+import hydra
 import torch
 from datasets import Dataset
+from omegaconf import DictConfig
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
@@ -33,21 +34,13 @@ class MemoryCallback(TrainerCallback):
         self.peak_vram_mb = max(self.peak_vram_mb, used_mb)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="GRPO baseline (TRL)")
-    parser.add_argument("--model-path", type=Path, required=True)
-    parser.add_argument("--adapter-path", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--total-steps", type=int, default=1000)
-    parser.add_argument("--n-samples", type=int, default=20)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--dsmezo-results", type=Path, required=True)
-    args = parser.parse_args()
+@hydra.main(version_base=None, config_path="../conf", config_name="grpo")
+def main(cfg: DictConfig):
+    model_name = Path(cfg.model.path).name
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_name = args.model_path.name
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    rank, target_modules = load_adapter_config(args.adapter_path)
+    rank, target_modules = load_adapter_config(cfg.model.adapter_path)
 
     train_data = load_mbpp_train()
     dataset = Dataset.from_list(train_data)
@@ -55,42 +48,41 @@ def main():
     print("=" * 70)
     print("GRPO BASELINE (TRL GRPOTrainer)")
     print(f"Model: {model_name} | PiSSA rank-{rank}")
-    print(f"Train: MBPP train ({len(train_data)} problems) | Steps: {args.total_steps}")
-    print(f"Eval: MBPP pass@k (n={args.n_samples}, T={args.temperature})")
+    print(f"Train: MBPP train ({len(train_data)} problems) | Steps: {cfg.training.total_steps}")
+    print(f"Eval: MBPP pass@k (n={cfg.eval.n_samples}, T={cfg.eval.temperature})")
     print("=" * 70)
 
     print("\nLoading vLLM engine for pre-training eval...")
     t0 = time.time()
-
-    eval_engine = create_engine(args.model_path, rank)
+    eval_engine = create_engine(cfg.model.path, rank)
     print(f"Engine loaded in {time.time()-t0:.1f}s")
 
-    lora_req = LoRARequest("pissa_init", 1, str(args.adapter_path))
+    lora_req = LoRARequest("pissa_init", 1, str(cfg.model.adapter_path))
     pre_mbpp = eval_mbpp(eval_engine, lora_request=lora_req,
-                         n_samples=args.n_samples, temperature=args.temperature)
+                         n_samples=cfg.eval.n_samples, temperature=cfg.eval.temperature)
+    ci = pre_mbpp["pass@1_ci95"]
     print(f"\n--- Pre-training baseline ---")
-    ci = pre_mbpp['pass@1_ci95']
-    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {pre_mbpp['num_tasks']} tasks)")
-    ci10 = pre_mbpp['pass@10_ci95']
-    print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
+    print(f"  MBPP pass@1: {pre_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}\u2013{ci[1]:.1%}, {pre_mbpp['num_tasks']} tasks)")
+    ci10 = pre_mbpp["pass@10_ci95"]
+    print(f"  MBPP pass@10: {pre_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}\u2013{ci10[1]:.1%})")
 
     torch.cuda.empty_cache()
 
     print("\nLoading model for GRPO training...")
-    tokenizer = AutoTokenizer.from_pretrained(str(args.model_path))
+    tokenizer = AutoTokenizer.from_pretrained(str(cfg.model.path))
     base_model = AutoModelForCausalLM.from_pretrained(
-        str(args.model_path), torch_dtype=torch.bfloat16,
+        str(cfg.model.path), torch_dtype=torch.bfloat16,
     )
-    model = PeftModel.from_pretrained(base_model, str(args.adapter_path))
+    model = PeftModel.from_pretrained(base_model, str(cfg.model.adapter_path))
 
     training_args = GRPOConfig(
-        output_dir=str(args.output_dir / "grpo_checkpoints"),
+        output_dir=str(output_dir / "grpo_checkpoints"),
         use_vllm=True,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.3,
         max_prompt_length=512,
         max_completion_length=512,
-        max_steps=args.total_steps,
+        max_steps=cfg.training.total_steps,
         num_generations=4,
         per_device_train_batch_size=4,
         gradient_checkpointing=True,
@@ -115,46 +107,45 @@ def main():
     free, total = torch.cuda.mem_get_info()
     mem_before_gb = (total - free) / (1024 ** 3)
 
-    print(f"\n--- Training ({args.total_steps} steps) ---")
+    print(f"\n--- Training ({cfg.training.total_steps} steps) ---")
     t_start = time.time()
     trainer.train()
     train_time = time.time() - t_start
     peak_vram_gb = mem_callback.peak_vram_mb / 1024
 
-    print(f"\nTraining complete: {train_time:.1f}s ({train_time/args.total_steps:.1f}s/step)")
+    print(f"\nTraining complete: {train_time:.1f}s ({train_time/cfg.training.total_steps:.1f}s/step)")
     print(f"  VRAM before training: {mem_before_gb:.1f} GB")
     print(f"  Peak VRAM:            {peak_vram_gb:.1f} GB")
 
-    adapter_save_path = args.output_dir / "trained_adapter"
+    adapter_save_path = output_dir / "trained_adapter"
     trainer.model.save_pretrained(str(adapter_save_path))
     torch.cuda.empty_cache()
 
     print("\nLoading vLLM engine for post-training eval...")
-
-    eval_engine = create_engine(args.model_path, rank)
+    eval_engine = create_engine(cfg.model.path, rank)
     lora_req = LoRARequest("grpo_trained", 1, str(adapter_save_path))
     post_mbpp = eval_mbpp(eval_engine, lora_request=lora_req,
-                          n_samples=args.n_samples, temperature=args.temperature)
+                          n_samples=cfg.eval.n_samples, temperature=cfg.eval.temperature)
 
+    ci = post_mbpp["pass@1_ci95"]
     print(f"\n--- Post-training evaluation ---")
-    ci = post_mbpp['pass@1_ci95']
-    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}–{ci[1]:.1%}, {post_mbpp['num_tasks']} tasks)")
-    ci10 = post_mbpp['pass@10_ci95']
-    print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}–{ci10[1]:.1%})")
+    print(f"  MBPP pass@1: {post_mbpp['pass@1']:.1%} (95% CI: {ci[0]:.1%}\u2013{ci[1]:.1%}, {post_mbpp['num_tasks']} tasks)")
+    ci10 = post_mbpp["pass@10_ci95"]
+    print(f"  MBPP pass@10: {post_mbpp['pass@10']:.1%} (95% CI: {ci10[0]:.1%}\u2013{ci10[1]:.1%})")
 
     delta_1 = post_mbpp["pass@1"] - pre_mbpp["pass@1"]
     delta_10 = post_mbpp["pass@10"] - pre_mbpp["pass@10"]
-    print(f"\n  pass@1: {pre_mbpp['pass@1']:.1%} → {post_mbpp['pass@1']:.1%} ({delta_1:+.1%})")
-    print(f"  pass@10: {pre_mbpp['pass@10']:.1%} → {post_mbpp['pass@10']:.1%} ({delta_10:+.1%})")
+    print(f"\n  pass@1: {pre_mbpp['pass@1']:.1%} \u2192 {post_mbpp['pass@1']:.1%} ({delta_1:+.1%})")
+    print(f"  pass@10: {pre_mbpp['pass@10']:.1%} \u2192 {post_mbpp['pass@10']:.1%} ({delta_10:+.1%})")
     print(f"  VRAM: {peak_vram_gb:.1f} GB | Time: {train_time:.1f}s")
 
     results = {
         "method": "grpo",
         "model": model_name,
         "rank": rank,
-        "train_steps": args.total_steps,
-        "n_samples": args.n_samples,
-        "temperature": args.temperature,
+        "train_steps": cfg.training.total_steps,
+        "n_samples": cfg.eval.n_samples,
+        "temperature": cfg.eval.temperature,
         "pre_mbpp": pre_mbpp,
         "post_mbpp": post_mbpp,
         "delta_pass@1": delta_1,
@@ -162,12 +153,12 @@ def main():
         "peak_vram_gb": peak_vram_gb,
         "mem_before_gb": mem_before_gb,
     }
-    results_path = args.output_dir / "grpo_results.json"
+    results_path = output_dir / "grpo_results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"  Results saved to {results_path}")
 
-    dsmezo = json.loads(args.dsmezo_results.read_text())
+    dsmezo = json.loads(Path(cfg.dsmezo_results).read_text())
     print("\n" + "=" * 70)
     print("COMPARATIVE RESULTS: DS-MeZO vs GRPO")
     print("=" * 70)

@@ -1,0 +1,17 @@
+model:
+  path: ???
+  adapter_path: ???
+
+training:
+  total_steps: 1000
+
+eval:
+  n_samples: 20
+  temperature: 0.2
+
+output_dir: ???
+dsmezo_results: ???
+
+hydra:
+  run:
+    dir: ${output_dir}

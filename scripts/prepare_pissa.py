@@ -1,7 +1,8 @@
-import argparse
 from pathlib import Path
 
+import hydra
 import torch
+from omegaconf import DictConfig
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -10,18 +11,12 @@ from ds_mezo.model_config import svd_power_iters
 _SVD_NITER = svd_power_iters()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="PiSSA decomposition")
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--targets", nargs="+", default=["q_proj", "v_proj"])
-    args = parser.parse_args()
-
-    model_path = args.model
-    output_dir = args.output
-    rank = args.rank
-    target_modules = args.targets
+@hydra.main(version_base=None, config_path="../conf", config_name="pissa")
+def main(cfg: DictConfig):
+    model_path = cfg.model.path
+    output_dir = Path(cfg.output_dir)
+    rank = cfg.model.rank
+    target_modules = list(cfg.model.targets)
     residual_dir = output_dir / "residual"
     adapter_dir = output_dir / "adapter"
 
@@ -29,8 +24,8 @@ def main():
     print(f"Rank: {rank} | Target modules: {target_modules}")
     print(f"SVD power iterations: {_SVD_NITER}")
 
-    residual_dir.mkdir(parents=True)
-    adapter_dir.mkdir(parents=True)
+    residual_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir.mkdir(parents=True, exist_ok=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path), device_map="cuda",

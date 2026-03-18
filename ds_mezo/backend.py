@@ -67,6 +67,8 @@ def _register_activation_hooks(worker, hook_map):
         keys = [(layer_idx, mod) for mod in hook_map[suffix]]
 
         def hook_fn(mod, inp, out, ks=keys):
+            if ks[0] in worker._ds_mezo_activations:
+                return
             act = inp[0].detach().float()
             for k in ks:
                 worker._ds_mezo_activations[k] = act
@@ -102,7 +104,7 @@ def _extract_prompt_logprobs(output, prompt_token_ids):
 
 
 class VLLMBackend:
-    def __init__(self, engine, layer_specs, rank, staging_dir=Path("/dev/shm/ds_mezo")):
+    def __init__(self, engine, layer_specs, rank, staging_dir):
         self.engine = engine
         self.rank = rank
 
@@ -155,12 +157,17 @@ class VLLMBackend:
         self.engine.llm_engine.add_lora(self.lora_pos)
         self.engine.llm_engine.add_lora(self.lora_neg)
 
-    def generate(self, batch, temperature, n):
+    def generate_with_activations(self, batch, temperature, n):
         self.query_count += len(batch) * n
+        self.engine.collective_rpc(
+            _register_activation_hooks, args=(self.hook_map,)
+        )
         gen_params = SamplingParams(n=n, temperature=temperature)
-        return self.engine.generate(
+        outputs = self.engine.generate(
             batch, sampling_params=gen_params, lora_request=self.lora_pos
         )
+        results = self.engine.collective_rpc(_collect_and_remove_hooks)
+        return outputs, results[0]
 
     def score(self, token_sequences, lora_request):
         self.query_count += len(token_sequences)
@@ -173,14 +180,3 @@ class VLLMBackend:
             for out, seq in zip(outputs, token_sequences)
         ]
 
-    def extract_activations(self, input_data):
-        self.query_count += len(input_data)
-        self.engine.collective_rpc(
-            _register_activation_hooks, args=(self.hook_map,)
-        )
-        self.engine.generate(
-            input_data,
-            SamplingParams(max_tokens=1, temperature=0.0),
-        )
-        results = self.engine.collective_rpc(_collect_and_remove_hooks)
-        return results[0]
