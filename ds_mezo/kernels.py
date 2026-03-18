@@ -2,19 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-
-# ── Minimax-optimal Newton-Schulz coefficients (Polar Express) ─────────────
-# Equioscillation Theorem (Chebyshev) gives the unique minimax degree-3 odd
-# polynomial on [ℓ, u]. Greedy composition is globally optimal (Theorem 4.1,
-# Amsel et al. 2025, arXiv:2505.16932). Closed-form per iteration — no search.
-#
-# Starting bound ℓ = √ε_f32: the Gram matrix G = X^T@X has entries involving
-# σ_i². When σ_i < √ε, σ_i² < ε and that SV's contribution to G is
-# indistinguishable from FP32 roundoff. Iteration count derived from
-# convergence criterion: iterate until max error < ε_f32.
-# Kernel form: S = c1·I + c3·(X^T@X), same as Newton-Schulz.
-
-
 def _ns_coefficients():
     eps = float(torch.finfo(torch.float32).eps)
     l, u = eps ** 0.5, 1.0
@@ -35,15 +22,6 @@ def _ns_coefficients():
 _NS_COEFFS = _ns_coefficients()
 _NS_C1 = tuple(c1 for c1, _ in _NS_COEFFS)
 _NS_C3 = tuple(c3 for _, c3 in _NS_COEFFS)
-# Produces 12 iterations from ℓ=√ε_f32≈3.45e-4 to convergence.
-# Performance: 12 iters × 2 passes + 3 = 27 global-memory passes per call.
-# At ~135μs/step total across 64 calls, <0.2% of vLLM-dominated step time.
-
-
-# ── Kernel 1: ZO-Muon spectral update ─────────────────────────────────────
-# Fuses: Frobenius normalize → N-S orthogonalization → parameter update.
-# Kalman gradient estimation (prediction + observation) runs in Python.
-# Single kernel launch per adapter matrix.
 
 @triton.jit
 def _zo_muon_tall_kernel(
@@ -54,10 +32,6 @@ def _zo_muon_tall_kernel(
     BLOCK_M: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
-    """ZO-Muon for tall matrices (M >= N). Tiles along M rows.
-    N-S degree-3 minimax: X = X @ (c1·I + c3·G), G = X.T@X. Inner product is (N, N).
-    buf already contains the Kalman posterior mean (updated in Python)."""
-
     offs_n = tl.arange(0, N)
     num_chunks = tl.cdiv(M, BLOCK_M)
 
@@ -84,9 +58,6 @@ def _zo_muon_tall_kernel(
         buf_tile = tl.load(buf_ptr + ptrs, mask=mask, other=0.0)
         tl.store(scratch_ptr + ptrs, buf_tile * inv_norm, mask=mask)
 
-    # Minimax-optimal degree-3 Newton-Schulz iterations (in-place on scratch)
-    # Each iteration: G = X.T@X, S = c1·I + c3·G, X = X@S
-    # Coefficients differ per iteration (Equioscillation Theorem, Polar Express)
     for ns_iter in tl.static_range(len(_NS_C1)):
         XtX = tl.zeros([N, N], dtype=tl.float32)
         for chunk in range(num_chunks):
@@ -130,9 +101,6 @@ def _zo_muon_wide_kernel(
     BLOCK_N: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
-    """ZO-Muon for wide matrices (M < N). Tiles along N columns.
-    N-S degree-3 minimax: X = (c1·I + c3·G) @ X, G = X@X.T. Inner product is (M, M).
-    buf already contains the Kalman posterior mean (updated in Python)."""
 
     offs_m = tl.arange(0, M)
     num_chunks = tl.cdiv(N, BLOCK_N)
@@ -217,12 +185,6 @@ def zo_muon_update(param, buf, scratch, eta, norm_floor):
             NORM_FLOOR=norm_floor,
         )
 
-
-# ── Kernel 2: Fused power iteration ───────────────────────────────────────
-# Replaces Python loop: for _ in range(iters): V = H.T @ (H @ V); V, _ = qr(V)
-# Fuses H.T @ H @ V matmul chain + modified Gram-Schmidt QR into one kernel.
-# Handles arbitrary D and R via pad-to-next-power-of-2 with masking.
-
 @triton.jit
 def _power_iter_kernel(
     H_ptr, V_ptr, out_ptr,
@@ -235,13 +197,6 @@ def _power_iter_kernel(
     BLOCK_T: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
-    """Fused power iteration: V_new = QR(H.T @ H @ V), repeated num_iters times.
-
-    H: (T, D_actual) activation matrix, V: (D_actual, R_actual) basis to refine.
-    D and R are padded to next power of 2 for register allocation; D_actual and
-    R_actual mask loads/stores to the actual tensor dimensions.
-    Tiles along T (token dimension). Modified Gram-Schmidt QR in registers.
-    """
     offs_d = tl.arange(0, D)
     offs_r = tl.arange(0, R)
     d_mask = offs_d < D_actual
@@ -309,14 +264,6 @@ def fused_power_iter(H, V, num_iters, norm_floor):
     )
     return out
 
-
-# ── Kernel 3: Fused AGZO perturbation (arXiv:2601.17261) ─────────────────
-# Column-space projection for z_A (Phase 3) is DS-MeZO's extension to AGZO.
-# Fuses: z_B = (z_coeff_B @ V.T) * eps, BV = B @ V, Q = QR(BV),
-#        z_A = (z_coeff_A @ Q[:,:min(R,RC)].T) * eps
-# Replaces 6 kernel launches per layer (2× matmul + QR + 2× matmul + 2× scale)
-# with 1 kernel. Eliminates cuSOLVER overhead on tiny (R, RC) matrix.
-
 @triton.jit
 def _agzo_perturb_kernel(
     B_ptr, V_ptr, z_coeff_B_ptr, z_coeff_A_ptr,
@@ -331,16 +278,6 @@ def _agzo_perturb_kernel(
     BLOCK_D: tl.constexpr,
     NORM_FLOOR: tl.constexpr,
 ):
-    """Fused AGZO perturbation for one adapter layer.
-
-    Phase 1: Tile over d_in — compute z_B = (z_coeff_B @ V.T) * eps
-             AND accumulate BV = B @ V. Shared tiling over d_in.
-    Phase 2: Modified Gram-Schmidt QR on first RC_A = min(R, RC) columns of BV.
-    Phase 3: Tile over d_out — compute z_A = (z_coeff_A @ Q[:,:RC_A].T) * eps.
-
-    Small-dim contractions (RC=8) use explicit rank-1 accumulation.
-    Large-dim contractions (BLOCK_D=128) use tl.dot.
-    """
     offs_r = tl.arange(0, R)
     offs_rc = tl.arange(0, RC)
     offs_rca = tl.arange(0, RC_A)
@@ -365,9 +302,6 @@ def _agzo_perturb_kernel(
             mask=d_mask[:, None], other=0.0,
         )
 
-        # z_B_tile = zcb @ V_tile.T = (R, RC) @ (RC, BLOCK_D) = (R, BLOCK_D)
-        # Manual rank-1 accumulation over RC (too small for tl.dot)
-        # Mask-based column extraction
         z_B_tile = tl.zeros([R, BLOCK_D], dtype=tl.float32)
         for k in tl.static_range(RC):
             k_mask = (offs_rc == k).to(tl.float32)
@@ -461,11 +395,6 @@ def fused_agzo_perturbation(B, V, z_coeff_B, z_coeff_A, eps, norm_floor):
         NORM_FLOOR=norm_floor,
     )
     return z_A, z_B
-
-
-# ── Kernel 4: Fused dual perturbation ─────────────────────────────────────
-# Computes θ+ = base + z and θ- = base - z in a single pass.
-# Halves kernel launches: 2 ops → 1 per matrix, ~112 launches/step saved.
 
 @triton.jit
 def _perturb_dual_kernel(

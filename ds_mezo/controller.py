@@ -32,16 +32,16 @@ class LayerState:
     layer_idx: int
     module_name: str
     peft_prefix: str
-    momentum_A: torch.Tensor | None = field(default=None, repr=False)
-    momentum_B: torch.Tensor | None = field(default=None, repr=False)
-    variance_A: torch.Tensor | None = field(default=None, repr=False)
-    variance_B: torch.Tensor | None = field(default=None, repr=False)
-    scratch_A: torch.Tensor | None = field(default=None, repr=False)
-    scratch_B: torch.Tensor | None = field(default=None, repr=False)
-    pos_A: torch.Tensor | None = field(default=None, repr=False)
-    pos_B: torch.Tensor | None = field(default=None, repr=False)
-    neg_A: torch.Tensor | None = field(default=None, repr=False)
-    neg_B: torch.Tensor | None = field(default=None, repr=False)
+    momentum_A: torch.Tensor
+    momentum_B: torch.Tensor
+    variance_A: torch.Tensor
+    variance_B: torch.Tensor
+    scratch_A: torch.Tensor
+    scratch_B: torch.Tensor
+    pos_A: torch.Tensor
+    pos_B: torch.Tensor 
+    neg_A: torch.Tensor
+    neg_B: torch.Tensor
 
     @property
     def key(self):
