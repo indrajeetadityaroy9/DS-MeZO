@@ -198,14 +198,15 @@ class DSMeZO_Controller:
         A, B = layer.A, layer.B
         V_l = self.activation_bases[layer.key]
 
-        # Variance-weighted B perturbation: sample proportional to posterior uncertainty
+        # Variance-weighted B perturbation — DS-MeZO (not BSZO, which uses deterministic argmax)
         var_B_proj = layer.variance_B @ (V_l ** 2)
         z_coeff_B = torch.randn(
             B.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
         ) * torch.sqrt(var_B_proj)
 
+        # Only min(R, RC) columns of QR(B@V) are non-degenerate
         z_coeff_A = torch.randn(
-            A.shape[0], V_l.shape[1], device="cuda", generator=self.rng,
+            A.shape[0], min(B.shape[0], V_l.shape[1]), device="cuda", generator=self.rng,
         )
 
         return fused_agzo_perturbation(B, V_l, z_coeff_B, z_coeff_A, self.eps, self.norm_floor)
@@ -231,7 +232,7 @@ class DSMeZO_Controller:
             for out in request_outputs[0].outputs
         ]
 
-        # Shrinkage RLOO — James-Stein optimal baseline
+        # Shrinkage RLOO — James-Stein baseline (concurrent: arXiv:2511.03710)
         rewards = torch.tensor([r for _, r in scored])
         N = len(scored)
         r_bar = float(rewards.mean())
@@ -270,6 +271,7 @@ class DSMeZO_Controller:
         return perturbations
 
     def _update_weights(self, perturbations, dd):
+        # Temporal Kalman filter — DS-MeZO (BSZO reinitializes each step)
         max_window = int(math.sqrt(self.total_steps))
         self._momentum = 1.0 - 1.0 / min(self.step_count, max_window)
         beta = self._momentum

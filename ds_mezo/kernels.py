@@ -310,9 +310,10 @@ def fused_power_iter(H, V, num_iters, norm_floor):
     return out
 
 
-# ── Kernel 3: Fused AGZO perturbation ─────────────────────────────────────
+# ── Kernel 3: Fused AGZO perturbation (arXiv:2601.17261) ─────────────────
+# Column-space projection for z_A (Phase 3) is DS-MeZO's extension to AGZO.
 # Fuses: z_B = (z_coeff_B @ V.T) * eps, BV = B @ V, Q = QR(BV),
-#        z_A = (z_coeff_A @ Q.T) * eps
+#        z_A = (z_coeff_A @ Q[:,:min(R,RC)].T) * eps
 # Replaces 6 kernel launches per layer (2× matmul + QR + 2× matmul + 2× scale)
 # with 1 kernel. Eliminates cuSOLVER overhead on tiny (R, RC) matrix.
 
@@ -321,7 +322,7 @@ def _agzo_perturb_kernel(
     B_ptr, V_ptr, z_coeff_B_ptr, z_coeff_A_ptr,
     z_A_ptr, z_B_ptr,
     d_in, d_out,
-    R: tl.constexpr, RC: tl.constexpr,
+    R: tl.constexpr, RC: tl.constexpr, RC_A: tl.constexpr,
     stride_b_r, stride_b_din,
     stride_v_din, stride_v_rc,
     stride_za_dout, stride_za_r,
@@ -334,14 +335,15 @@ def _agzo_perturb_kernel(
 
     Phase 1: Tile over d_in — compute z_B = (z_coeff_B @ V.T) * eps
              AND accumulate BV = B @ V. Shared tiling over d_in.
-    Phase 2: Modified Gram-Schmidt QR on BV (R × RC) in registers.
-    Phase 3: Tile over d_out — compute z_A = (z_coeff_A @ Q.T) * eps.
+    Phase 2: Modified Gram-Schmidt QR on first RC_A = min(R, RC) columns of BV.
+    Phase 3: Tile over d_out — compute z_A = (z_coeff_A @ Q[:,:RC_A].T) * eps.
 
     Small-dim contractions (RC=8) use explicit rank-1 accumulation.
     Large-dim contractions (BLOCK_D=128) use tl.dot.
     """
     offs_r = tl.arange(0, R)
     offs_rc = tl.arange(0, RC)
+    offs_rca = tl.arange(0, RC_A)
 
     # Load z_coeff_B: (R, RC) — always fits in registers
     zcb = tl.load(
@@ -389,10 +391,9 @@ def _agzo_perturb_kernel(
         # BV += B_tile @ V_tile = (R, BLOCK_D) @ (BLOCK_D, RC) = (R, RC)
         BV += tl.dot(B_tile, V_tile, allow_tf32=False)
 
-    # Phase 2: Modified Gram-Schmidt QR on BV (R, RC) — in registers
-    # Uses mask-based gather/scatter (Triton 3.6.0 disallows Q[:, col] indexing)
+    # Phase 2: QR on first RC_A columns of BV (rank <= R, rest is degenerate)
     Q = BV
-    for col in tl.static_range(RC):
+    for col in tl.static_range(RC_A):
         col_mask = (offs_rc == col).to(tl.float32)
         v_col = tl.sum(Q * col_mask[None, :], axis=1)
         for prev in tl.static_range(col):
@@ -412,20 +413,17 @@ def _agzo_perturb_kernel(
         offs_do = do_start + tl.arange(0, BLOCK_D)
         do_mask = offs_do < d_out
 
-        # Load z_coeff_A_tile: (BLOCK_D, RC)
+        # Load z_coeff_A_tile: (BLOCK_D, RC_A) — row stride is RC_A
         zca_tile = tl.load(
-            z_coeff_A_ptr + offs_do[:, None] * RC + offs_rc[None, :],
+            z_coeff_A_ptr + offs_do[:, None] * RC_A + offs_rca[None, :],
             mask=do_mask[:, None], other=0.0,
         )
 
-        # z_A_tile = zca_tile @ Q.T = (BLOCK_D, RC) @ (RC, R) = (BLOCK_D, R)
-        # Manual rank-1 accumulation over RC
-        # Mask-based column extraction
+        # z_A_tile = zca_tile @ Q[:,:RC_A].T = (BLOCK_D, RC_A) @ (RC_A, R)
         z_A_tile = tl.zeros([BLOCK_D, R], dtype=tl.float32)
-        for k in tl.static_range(RC):
-            k_mask = (offs_rc == k).to(tl.float32)
-            zca_k = tl.sum(zca_tile * k_mask[None, :], axis=1)   # (BLOCK_D,)
-            Q_k = tl.sum(Q * k_mask[None, :], axis=1)            # (R,)
+        for k in tl.static_range(RC_A):
+            zca_k = tl.sum(zca_tile * (offs_rca == k).to(tl.float32)[None, :], axis=1)
+            Q_k = tl.sum(Q * (offs_rc == k).to(tl.float32)[None, :], axis=1)
             z_A_tile += zca_k[:, None] * Q_k[None, :]
         z_A_tile *= eps
 
@@ -444,6 +442,7 @@ def fused_agzo_perturbation(B, V, z_coeff_B, z_coeff_A, eps, norm_floor):
     R, d_in = B.shape
     _, RC = V.shape
     d_out, _ = z_coeff_A.shape
+    RC_A = min(R, RC)
 
     z_A = torch.empty(d_out, R, device="cuda", dtype=torch.float32)
     z_B = torch.empty(R, d_in, device="cuda", dtype=torch.float32)
@@ -452,7 +451,7 @@ def fused_agzo_perturbation(B, V, z_coeff_B, z_coeff_A, eps, norm_floor):
         B, V, z_coeff_B, z_coeff_A,
         z_A, z_B,
         d_in, d_out,
-        R=R, RC=RC,
+        R=R, RC=RC, RC_A=RC_A,
         stride_b_r=B.stride(0), stride_b_din=B.stride(1),
         stride_v_din=V.stride(0), stride_v_rc=V.stride(1),
         stride_za_dout=z_A.stride(0), stride_za_r=z_A.stride(1),
